@@ -20,7 +20,7 @@ import re
 import sys
 import traceback
 import tkinter as tk
-from tkinter import filedialog, messagebox, scrolledtext
+from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 from docx import Document
 from docx.shared import Cm, Pt, Emu, RGBColor
@@ -296,21 +296,43 @@ def _normalizar_espacos(s):
     return re.sub(r"\s+", " ", s).strip()
 
 
+def _remover_boilerplate_paginacao(bloco):
+    """Remove as linhas de paginacao (Continua Proxima Pagina /
+    Continuacao do instrumento... / Pagina: N sozinha) de dentro de um
+    trecho de texto -- usado pra descricao do imovel nao "puxar" esses
+    artefatos quando a secao atravessa mais de uma pagina do PRN."""
+    linhas = bloco.split("\n")
+    linhas_limpas = [
+        l for l in linhas
+        if not (
+            PADRAO_CONTINUA_PROXIMA.search(l)
+            or PADRAO_CONTINUACAO_HEADER.search(l)
+            or PADRAO_PAGINA_SOZINHA.match(l)
+        )
+    ]
+    return "\n".join(linhas_limpas)
+
+
 def detectar_secao_imoveis(texto):
     """
     Localiza a secao "2 - IMOVEIS:" e verifica: (a) se ha mencao a
     hipoteca dentro dela, (b) os valores de avaliacao informados, e
     (c) se os dois valores de avaliacao sao identicos (possivel erro
-    de preenchimento duplicado).　Retorna None se a secao nao existir
+    de preenchimento duplicado). Retorna None se a secao nao existir
     no documento (ex: cedulas sem esse tipo de garantia).
+
+    A secao pode atravessar varias paginas do PRN (descricao de imovel
+    grande) -- o limite de seguranca e bem folgado (50 mil caracteres)
+    pra nao cortar nada nesse caso, e as linhas de paginacao que
+    aparecem no meio do caminho sao removidas antes de analisar.
     """
     m_inicio = PADRAO_SECAO_IMOVEIS.search(texto)
     if not m_inicio:
         return None
 
     m_fim = PADRAO_FIM_SECAO_IMOVEIS.search(texto, m_inicio.end())
-    fim = m_fim.start() if m_fim else min(m_inicio.end() + 4000, len(texto))
-    bloco = texto[m_inicio.start():fim]
+    fim = m_fim.start() if m_fim else min(m_inicio.end() + 50000, len(texto))
+    bloco = _remover_boilerplate_paginacao(texto[m_inicio.start():fim])
 
     hipoteca_m = PADRAO_HIPOTECA.search(bloco)
     avaliado_m = PADRAO_AVALIADO_EM.search(bloco)
@@ -371,16 +393,93 @@ def montar_texto_revisao(deteccao):
 def aplicar_correcao_imoveis(texto, deteccao, texto_revisado):
     """Substitui o bloco original da secao '2 - IMOVEIS:' pelo texto
     revisado (editado na tela), formatado com o mesmo recuo padrao do
-    resto do documento."""
+    resto do documento. Devolve (novo_texto, posicao_onde_a_descricao_termina)
+    -- essa posicao e usada por aplicar_clausula_superveniencia para
+    inserir a clausula logo apos a descricao, mesmo que ela tenha mudado
+    de tamanho."""
     linhas_novas = ["      2 - IMÓVEIS:", "      "]
     for linha in texto_revisado.split("\n"):
         linhas_novas.append("      " + linha if linha.strip() else "      ")
     bloco_novo = "\r\n".join(linhas_novas) + "\r\n      \r\n"
 
-    return texto[:deteccao["span_inicio"]] + bloco_novo + texto[deteccao["span_fim"]:]
+    novo_texto = texto[:deteccao["span_inicio"]] + bloco_novo + texto[deteccao["span_fim"]:]
+    posicao_fim = deteccao["span_inicio"] + len(bloco_novo)
+    return novo_texto, posicao_fim
 
 
-# ======================================================================
+# --------------------------------------------------------------------
+# Clausula de Superveniencia (aba "Opcoes")
+# --------------------------------------------------------------------
+
+TEXTO_CLAUSULA_SUPERVENIENCIA = (
+    "CONSTITUIÇÃO DA ALIENAÇÃO FIDUCIÁRIA DA PROPRIEDADE SUPERVENIENTE: "
+    "O imóvel objeto da garantia é constituído em ALIENAÇÃO FIDUCIÁRIA SUPERVENIENTE, "
+    "nos termos do §3º do art. 22 da Lei n° 9.514/1997, com a redação dada pela Lei "
+    "14.711/2023. Parágrafo Único: Na hipótese de constituição de alienações "
+    "fiduciárias sucessivas da propriedade superveniente e/ou quando houver a extensão "
+    "da garantia fiduciária, havendo o inadimplemento de quaisquer das obrigações "
+    "garantidas pelo mesmo imóvel, fica desde já autorizado ao CREDOR determinar o "
+    "vencimento antecipado das demais obrigações de que for titular, nos termos do §6º "
+    "do artigo 22 da Lei 9.514/2023, com a redação dada pela Lei 14.711/2023."
+)
+
+PADRAO_CLAUSULA_SUPERVENIENCIA = re.compile(
+    r"CONSTITUI[ÇC][ÃA]O\s+DA\s+ALIENA[ÇC][ÃA]O\s+FIDUCI[ÁA]RIA\s+DA\s+PROPRIEDADE\s+SUPERVENIENTE",
+    re.IGNORECASE,
+)
+
+# marcadores invisiveis (area de uso privado do Unicode -- nao aparecem
+# como texto de verdade) usados so pra sinalizar pro gerador do Word
+# qual trecho foi ACRESCENTADO pelo script, pra colorir diferente do
+# resto e o colaborador saber o que foi adicionado x o que veio no PRN.
+MARCADOR_ADICIONADO_INICIO = "\ue000"
+MARCADOR_ADICIONADO_FIM = "\ue001"
+
+
+def detectar_clausula_superveniencia(texto):
+    """True se a clausula de superveniencia ja existe no documento."""
+    return bool(PADRAO_CLAUSULA_SUPERVENIENCIA.search(texto))
+
+
+def aplicar_clausula_superveniencia(texto, posicao_insercao, adicionar):
+    """Insere a clausula de superveniencia logo na posicao indicada (logo
+    apos a descricao do imovel), marcada como "acrescentada" (cor
+    diferente no Word). So insere se adicionar=True -- quem decide ANTES
+    se deve chamar isso ou nao e a logica de "so acrescenta se nao
+    existia e o colaborador marcou o checkbox" (ver finalizar_geracao)."""
+    if not adicionar:
+        return texto
+
+    bloco = (
+        "\r\n      \r\n      "
+        + MARCADOR_ADICIONADO_INICIO
+        + TEXTO_CLAUSULA_SUPERVENIENCIA
+        + MARCADOR_ADICIONADO_FIM
+        + "\r\n      \r\n"
+    )
+    return texto[:posicao_insercao] + bloco + texto[posicao_insercao:]
+
+
+# --------------------------------------------------------------------
+# Cartorio (aba "Opcoes") -- deteccao simples por enquanto; no futuro vai
+# cruzar com uma planilha de criterios por cartorio.
+# --------------------------------------------------------------------
+
+PADRAO_CARTORIO = re.compile(
+    r"Registro\s+de\s+Im[oó]veis[^\r\n,\.]*(?:Comarca\s+de\s+[^\r\n,\.]+)?",
+    re.IGNORECASE,
+)
+
+
+def detectar_cartorio(texto):
+    """Tenta achar o nome do cartorio/comarca citado na descricao do
+    imovel (ex: 'Registro de Imoveis Comarca de Mandaguacu - PR').
+    Retorna None se nao encontrar nada parecido."""
+    m = PADRAO_CARTORIO.search(texto)
+    return _normalizar_espacos(m.group(0)) if m else None
+
+
+
 # ETAPA 5: GERAR O WORD (python-docx)
 # ======================================================================
 
@@ -425,7 +524,10 @@ def _linhas_de_qualificacao(dados):
 PADRAO_TABULAR_ESPACO = re.compile(r"\S {4,}\S")
 PADRAO_SEPARADOR = re.compile(r"^[\-=_]{5,}$")
 PADRAO_CAMPO_FORMULARIO = re.compile(r"\.{3,}\s*:")
-PADRAO_CABECALHO_TABELA = re.compile(r"Nro\s+Data|Ref\.BACEN|Quadro\s+Resumo", re.IGNORECASE)
+PADRAO_CABECALHO_TABELA = re.compile(r"^(Nro\s+Data|Ref\.BACEN|Quadro\s+Resumo\s+da)", re.IGNORECASE)
+# numeracao de clausula/item no comeco da linha (1., 3., (iii), a), i.) --
+# sozinha ja cria um "gap" de varios espacos que nao e uma tabela de verdade
+PADRAO_NUMERACAO_CLAUSULA = re.compile(r"^\s*(?:\(?[ivxlcdm]{1,6}\)|\(?[a-zA-Z]\)|\d+[.\)])\s+", re.IGNORECASE)
 
 
 def _reflow_prosa(linhas_texto):
@@ -440,15 +542,14 @@ def _classificar_bloco(linhas_texto):
         return "assinatura"
 
     linhas_stripped = [l.strip() for l in linhas_texto]
+    # so classifica como tabular com marcadores confiaveis: linha
+    # separadora (----/====) ou cabecalho de tabela conhecido. A
+    # heuristica antiga (maioria das linhas com espaco largo) foi
+    # removida -- texto justificado normal tambem pode ter gaps largos
+    # quando a linha tem poucas palavras pra preencher a largura, e
+    # isso gerava falso positivo em clausulas normais.
     if any(PADRAO_SEPARADOR.match(l) or PADRAO_CABECALHO_TABELA.search(l) for l in linhas_stripped):
         return "tabular"
-    # so classifica como tabular se a MAIORIA das linhas do bloco tiverem
-    # esse padrao de colunas -- uma unica linha de prosa muito justificada
-    # tambem pode ter 1 gap grande, mas nao o bloco inteiro
-    if len(linhas_stripped) >= 2:
-        com_gap = sum(1 for l in linhas_stripped if PADRAO_TABULAR_ESPACO.search(l))
-        if com_gap / len(linhas_stripped) >= 0.6:
-            return "tabular"
 
     if any(PADRAO_CAMPO_FORMULARIO.search(l) for l in linhas_texto):
         return "formulario"
@@ -474,7 +575,108 @@ def _adicionar_campo_pagina(paragraph):
     run.font.color.rgb = RGBColor(0, 0, 0)
 
 
+def _adicionar_texto_exceto_ultima_pagina(paragraph, texto_condicional):
+    """Insere um campo condicional do Word: so mostra 'texto_condicional'
+    quando a pagina atual NAO for a ultima pagina da secao (campo IF com
+    PAGE e SECTIONPAGES aninhados). Assim o rodape "Continua Proxima
+    Pagina" desaparece sozinho na ultima pagina, sem precisar criar
+    nenhuma secao/pagina extra -- o Word calcula isso dinamicamente,
+    entao continua correto mesmo se o texto for editado depois."""
+
+    def _fld_char(tipo):
+        el = OxmlElement("w:fldChar")
+        el.set(qn("w:fldCharType"), tipo)
+        return el
+
+    def _instr(texto):
+        el = OxmlElement("w:instrText")
+        el.set(qn("xml:space"), "preserve")
+        el.text = texto
+        return el
+
+    run = paragraph.add_run()
+    run.font.name = "Courier New"
+    run.font.size = Pt(FONTE_PT)
+    run.font.color.rgb = RGBColor(0, 0, 0)
+    r = run._r
+
+    r.append(_fld_char("begin"))  # campo IF (externo)
+    r.append(_instr(' IF '))
+    r.append(_fld_char("begin"))  # campo PAGE (aninhado)
+    r.append(_instr(' PAGE '))
+    r.append(_fld_char("end"))
+    r.append(_instr(' <> '))
+    r.append(_fld_char("begin"))  # campo SECTIONPAGES (aninhado)
+    r.append(_instr(' SECTIONPAGES '))
+    r.append(_fld_char("end"))
+    r.append(_instr(f' "{texto_condicional}" ""'))
+    r.append(_fld_char("separate"))
+    # texto de exibicao inicial (o Word recalcula ao abrir o arquivo)
+    texto_inicial = OxmlElement("w:t")
+    texto_inicial.set(qn("xml:space"), "preserve")
+    texto_inicial.text = texto_condicional
+    r.append(texto_inicial)
+    r.append(_fld_char("end"))
+
+
 PADRAO_CARTILHA = re.compile(r"CARTILHA\s+DO\s+CR[EÉ]DITO\s+RURAL:", re.IGNORECASE)
+
+
+PADRAO_ITEM_LISTA_CARTILHA = re.compile(r"^\s*-\s")
+PADRAO_TERMINA_FRASE = re.compile(r"[.:;]\s*$")
+PADRAO_SICREDI_FONE = re.compile(r"SICREDI\s+FONE", re.IGNORECASE)
+
+
+def _mesclar_topicos_cartilha(linhas):
+    """Junta linhas quebradas por largura fixa em um paragrafo por
+    'topico' (paragrafo, cabecalho ou item de lista com '-'), evitando
+    que um heading fique despedacado por uma quebra de pagina do PRN
+    original caindo no meio da frase (2+ linhas em branco seguidas e a
+    frase anterior nao termina em pontuacao = artefato de pagina, nao
+    paragrafo novo). Itens de lista com '-' sempre comecam um topico
+    novo, mesmo sem linha em branco antes (e como vem no PRN)."""
+    resultado = []
+    topico_atual = []
+
+    def ultima_linha_nao_vazia():
+        for l in reversed(topico_atual):
+            if l.strip():
+                return l.strip()
+        return ""
+
+    def fechar_topico():
+        if topico_atual:
+            resultado.append(_reflow_prosa(topico_atual))
+            topico_atual.clear()
+
+    i = 0
+    while i < len(linhas):
+        linha = linhas[i]
+        if linha.strip() == "":
+            j = i
+            while j < len(linhas) and linhas[j].strip() == "":
+                j += 1
+            n_blanks = j - i
+            ultima = ultima_linha_nao_vazia()
+            termina_frase = bool(PADRAO_TERMINA_FRASE.search(ultima)) if ultima else True
+
+            if n_blanks == 1 or termina_frase:
+                fechar_topico()
+                resultado.append("")
+            # senao (2+ linhas em branco e a frase anterior nao termina em
+            # pontuacao): artefato de quebra de pagina no meio da frase --
+            # ignora as linhas em branco e continua o topico atual
+            i = j
+            continue
+
+        if PADRAO_ITEM_LISTA_CARTILHA.match(linha) and topico_atual:
+            fechar_topico()
+
+        topico_atual.append(linha)
+        i += 1
+
+    fechar_topico()
+    return resultado
 
 
 def gerar_docx(texto, blocos, assinaturas_qualificadas, caminho_saida):
@@ -540,7 +742,12 @@ def gerar_docx(texto, blocos, assinaturas_qualificadas, caminho_saida):
                 apartir_sicor = True
             linhas_flat.append({
                 "texto": linha,
-                "quebra_forcada": idx_pagina > 0 and idx_linha == 0,
+                # NAO forca quebra de pagina nos limites originais do PRN --
+                # agora que o texto reflui em prosa compacta, isso so
+                # desperdicava espaco (paginas terminando com muito branco
+                # sobrando). O conteudo flui naturalmente; so o bloco de
+                # assinatura continua protegido contra ficar dividido.
+                "quebra_forcada": False,
                 "fonte_menor": apartir_sicor,
             })
 
@@ -672,39 +879,22 @@ def gerar_docx(texto, blocos, assinaturas_qualificadas, caminho_saida):
     _run_padrao(p_header, f"Continuação do instrumento de crédito do título {numero_titulo}.\tPagina: ")
     _adicionar_campo_pagina(p_header)
 
-    # rodape (todas as paginas): "Continua Proxima Pagina" alinhado a direita
+    # rodape (todas as paginas, exceto a ultima da secao): "Continua
+    # Proxima Pagina" alinhado a direita -- campo condicional, some
+    # sozinho na ultima pagina (onde termina o instrumento e comeca a
+    # Cartilha, um documento diferente).
     for rodape in (secao.footer, secao.first_page_footer):
         p_footer = rodape.paragraphs[0]
         p_footer.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-        _run_padrao(p_footer, "Continua Proxima Pagina")
+        _adicionar_texto_exceto_ultima_pagina(p_footer, "Continua Proxima Pagina")
     # -------------------------------------------------------------------------
 
-    altura_pagina_pt = 14 * 72  # Legal em retrato: altura = 14"
-    margem_topo_pt = 0.7 / 2.54 * 72
-    margem_rodape_pt = 1.25 / 2.54 * 72
-    altura_util_pt = altura_pagina_pt - margem_topo_pt - margem_rodape_pt
-
-    largura_pagina_pt = 8.5 * 72  # Legal em retrato: largura = 8.5"
-    margem_lateral_pt = 1.5 / 2.54 * 72
-    largura_util_pt = largura_pagina_pt - (2 * margem_lateral_pt)
-    max_chars_por_linha = max(1, int(largura_util_pt // (FONTE_PT * FATOR_LARGURA_CHAR)))
-
-    def linhas_visuais(texto_linha):
-        """Estima em quantas linhas visuais uma linha logica vai quebrar
-        no Word, ja que em retrato varias linhas do PRN (ate 127
-        caracteres) nao cabem mais numa unica linha da pagina."""
-        n = len(texto_linha)
-        return max(1, -(-n // max_chars_por_linha))  # ceil sem precisar de math.ceil
-
     altura_linha_pt = FONTE_PT * FATOR_ALTURA_LINHA
-    # folga de seguranca de 15% -- em paragrafos corridos longos (texto em
-    # prosa), pequenos erros na estimativa de largura de caractere se
-    # acumulam ao longo do paragrafo inteiro, e podem fazer sobrar um
-    # pouco de texto vazando pra proxima pagina. Preferimos terminar a
-    # pagina um pouco mais cedo a arriscar esse vazamento.
-    max_linhas_por_pagina = int((altura_util_pt // altura_linha_pt) * 0.85)
 
-    def adicionar_paragrafo(texto_linha, quebra_antes, fonte_menor):
+    def adicionar_paragrafo(texto_linha, fonte_menor, manter_com_proximo=False, manter_junto=False):
+        eh_adicionado = MARCADOR_ADICIONADO_INICIO in texto_linha
+        texto_limpo = texto_linha.replace(MARCADOR_ADICIONADO_INICIO, "").replace(MARCADOR_ADICIONADO_FIM, "")
+
         p = doc.add_paragraph()
         p.alignment = WD_ALIGN_PARAGRAPH.LEFT
         pf = p.paragraph_format
@@ -715,81 +905,130 @@ def gerar_docx(texto, blocos, assinaturas_qualificadas, caminho_saida):
         # cresce em vez de sobrepor o texto da linha seguinte.
         pf.line_spacing_rule = WD_LINE_SPACING.AT_LEAST
         pf.line_spacing = Pt(FONTE_MENOR_PT * FATOR_ALTURA_LINHA if fonte_menor else altura_linha_pt)
-        pf.page_break_before = quebra_antes
-        run = p.add_run(texto_linha if len(texto_linha) else " ")
+        # deixa o WORD decidir onde quebrar a pagina (dinamico de
+        # verdade) -- so pedimos pra ele manter certos paragrafos juntos,
+        # em vez de calcular por fora quantas linhas cabem.
+        pf.keep_with_next = manter_com_proximo
+        pf.keep_together = manter_junto
+        run = p.add_run(texto_limpo if len(texto_limpo) else " ")
         run.font.name = "Courier New"
         run.font.size = Pt(FONTE_MENOR_PT if fonte_menor else FONTE_PT)
+        if eh_adicionado:
+            run.font.color.rgb = RGBColor(0, 51, 153)  # azul -- sinaliza texto acrescentado pelo script
         return p
 
-    linhas_restantes = max_linhas_por_pagina
-    primeira_unidade = True
     for u in unidades:
-        if u["tipo"] == "bloco":
-            num_linhas = sum(linhas_visuais(l["texto"]) for l in u["linhas"])
-        else:
-            num_linhas = linhas_visuais(u["linha"]["texto"])
-        quebra_forcada = u["quebra_forcada"] if u["tipo"] == "bloco" else u["linha"]["quebra_forcada"]
-        quebra_antes = False
-
-        if not primeira_unidade and quebra_forcada:
-            quebra_antes = True
-            linhas_restantes = max_linhas_por_pagina
-        elif not primeira_unidade and num_linhas <= max_linhas_por_pagina and num_linhas > linhas_restantes:
-            quebra_antes = True
-            linhas_restantes = max_linhas_por_pagina
-
-        linhas_restantes -= num_linhas
-        primeira_unidade = False
-
         if u["tipo"] == "linha":
-            adicionar_paragrafo(u["linha"]["texto"], quebra_antes, u["linha"]["fonte_menor"])
+            adicionar_paragrafo(u["linha"]["texto"], u["linha"]["fonte_menor"])
         else:
+            n_linhas_bloco = len(u["linhas"])
             for idx, l in enumerate(u["linhas"]):
-                adicionar_paragrafo(l["texto"], quebra_antes if idx == 0 else False, l["fonte_menor"])
+                eh_ultima_linha_do_bloco = idx == n_linhas_bloco - 1
+                adicionar_paragrafo(
+                    l["texto"], l["fonte_menor"],
+                    manter_com_proximo=not eh_ultima_linha_do_bloco,
+                    manter_junto=True,
+                )
 
-    # -------- 2a secao: Cartilha em diante, fiel ao original -------------
+    # -------- 2a e 3a secoes: Cartilha e Extrato SICOR, fieis ao original -----
     # nenhuma das regras (reflow/tabela/qualificacao/cabecalho fixo) se
     # aplica aqui -- cada linha do PRN vira um paragrafo tal como veio,
-    # e essa secao nao tem cabecalho/rodape (a paginacao "oficial" do
-    # instrumento acaba na ultima assinatura).
-    if texto_verbatim:
-        secao2 = doc.add_section(WD_SECTION.NEW_PAGE)
-        secao2.page_width = secao.page_width
-        secao2.page_height = secao.page_height
-        secao2.top_margin = secao.top_margin
-        secao2.bottom_margin = secao.bottom_margin
-        secao2.left_margin = secao.left_margin
-        secao2.right_margin = secao.right_margin
+    # e essas secoes nao tem cabecalho/rodape (a paginacao "oficial" do
+    # instrumento acaba na ultima assinatura). Margens quase zero nas
+    # duas ("sem espaçamento"); a do Extrato SICOR fica em fonte 7pt.
+    m_sicor = re.search(re.escape(MARCADOR_FONTE_MENOR), texto_verbatim)
+    if m_sicor:
+        texto_cartilha_only = texto_verbatim[: m_sicor.start()]
+        texto_sicor_only = texto_verbatim[m_sicor.start():]
+    else:
+        texto_cartilha_only = texto_verbatim
+        texto_sicor_only = ""
 
-        secao2.header.is_linked_to_previous = False
-        secao2.footer.is_linked_to_previous = False
-        secao2.first_page_header.is_linked_to_previous = False
-        secao2.first_page_footer.is_linked_to_previous = False
-        for p in secao2.header.paragraphs:
+    def _nova_secao_sem_espacamento(margem_lateral):
+        s = doc.add_section(WD_SECTION.NEW_PAGE)
+        s.page_width = secao.page_width
+        s.page_height = secao.page_height
+        s.top_margin = Cm(0.2)
+        s.bottom_margin = Cm(0.2)
+        s.left_margin = margem_lateral
+        s.right_margin = margem_lateral
+        s.header.is_linked_to_previous = False
+        s.footer.is_linked_to_previous = False
+        s.first_page_header.is_linked_to_previous = False
+        s.first_page_footer.is_linked_to_previous = False
+        for p in s.header.paragraphs:
             p.text = ""
-        for p in secao2.footer.paragraphs:
+        for p in s.footer.paragraphs:
             p.text = ""
-        for p in secao2.first_page_header.paragraphs:
+        for p in s.first_page_header.paragraphs:
             p.text = ""
-        for p in secao2.first_page_footer.paragraphs:
+        for p in s.first_page_footer.paragraphs:
             p.text = ""
+        return s
 
-        paginas_verbatim = texto_verbatim.split("\x0c")
-        for idx_pag, pagina in enumerate(paginas_verbatim):
-            linhas_pagina = [l.replace("\r", "") for l in pagina.replace("\r\n", "\n").split("\n")]
-            for idx_lin, linha in enumerate(linhas_pagina):
-                p = doc.add_paragraph()
-                p.alignment = WD_ALIGN_PARAGRAPH.LEFT
-                pf = p.paragraph_format
-                pf.space_after = Pt(0)
-                pf.space_before = Pt(0)
-                pf.line_spacing_rule = WD_LINE_SPACING.AT_LEAST
-                pf.line_spacing = Pt(altura_linha_pt)
-                pf.page_break_before = idx_pag > 0 and idx_lin == 0
-                run = p.add_run(linha if linha else " ")
-                run.font.name = "Courier New"
-                run.font.size = Pt(FONTE_PT)
-                run.font.color.rgb = RGBColor(0, 0, 0)
+    def _adicionar_paginas_verbatim(texto_bloco, tamanho_fonte, mesclar_topicos=False):
+        linhas_todas = []
+        for pagina in texto_bloco.split("\x0c"):
+            linhas_todas.extend(l.replace("\r", "") for l in pagina.replace("\r\n", "\n").split("\n"))
+
+        linhas_centralizadas = set()
+
+        if mesclar_topicos:
+            # separa o bloco final "SICREDI FONE" (4 linhas fixas de
+            # contato) do resto -- ele NAO deve ser mesclado com o
+            # topico anterior, e cada uma das 4 linhas fica centralizada
+            # e sem o preenchimento de espacos antigo (calculado pra
+            # largura de pagina antiga).
+            idx_sicredi = next(
+                (i for i, l in enumerate(linhas_todas) if PADRAO_SICREDI_FONE.search(l)), None
+            )
+            if idx_sicredi is not None:
+                antes = linhas_todas[:idx_sicredi]
+                bloco_contato = [l.strip() for l in linhas_todas[idx_sicredi:idx_sicredi + 4] if l.strip()]
+                depois = linhas_todas[idx_sicredi + 4:]
+
+                topicos = _mesclar_topicos_cartilha(antes)
+                # tira blanks do final e poe exatamente 3 antes do bloco de contato
+                while topicos and topicos[-1] == "":
+                    topicos.pop()
+                topicos.extend([""] * 3)
+
+                inicio_centralizadas = len(topicos)
+                topicos.extend(bloco_contato)
+                linhas_centralizadas = set(range(inicio_centralizadas, len(topicos)))
+
+                topicos.extend(_mesclar_topicos_cartilha(depois))
+                linhas_todas = topicos
+            else:
+                linhas_todas = _mesclar_topicos_cartilha(linhas_todas)
+
+        altura_linha_local_pt = tamanho_fonte * FATOR_ALTURA_LINHA
+
+        # deixa o Word decidir onde quebrar a pagina -- so pede pra
+        # manter cada topico/linha inteiro junto (nao dividir no meio),
+        # sem calcular quantas linhas cabem por pagina.
+        for idx_linha, linha in enumerate(linhas_todas):
+            p = doc.add_paragraph()
+            centralizar = idx_linha in linhas_centralizadas or MARCADOR_FONTE_MENOR in linha
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER if centralizar else WD_ALIGN_PARAGRAPH.LEFT
+            pf = p.paragraph_format
+            pf.space_after = Pt(0)
+            pf.space_before = Pt(0)
+            pf.line_spacing_rule = WD_LINE_SPACING.AT_LEAST
+            pf.line_spacing = Pt(altura_linha_local_pt)
+            pf.keep_together = True
+            run = p.add_run(linha if linha else " ")
+            run.font.name = "Courier New"
+            run.font.size = Pt(tamanho_fonte)
+            run.font.color.rgb = RGBColor(0, 0, 0)
+
+    if texto_cartilha_only:
+        _nova_secao_sem_espacamento(Cm(1.5))
+        _adicionar_paginas_verbatim(texto_cartilha_only, FONTE_PT, mesclar_topicos=True)
+
+    if texto_sicor_only:
+        _nova_secao_sem_espacamento(Cm(0))
+        _adicionar_paginas_verbatim(texto_sicor_only, 7)
 
     doc.save(caminho_saida)
 
@@ -827,6 +1066,11 @@ def preparar_arquivo(caminho_prn, log=print):
         else:
             log("  Seção '2 - IMÓVEIS' encontrada (sem hipoteca, valores de avaliação distintos).")
 
+    tem_clausula_superveniencia = detectar_clausula_superveniencia(texto)
+    cartorio_detectado = detectar_cartorio(texto)
+    log(f"  Cláusula de Superveniência: {'encontrada' if tem_clausula_superveniencia else 'não encontrada'}.")
+    log(f"  Cartório detectado: {cartorio_detectado or '(nenhum)'}")
+
     emitente = next((b for b in blocos if b["papel"] == "EMITENTE"), None)
     nome_emitente = emitente["nome"].strip() if emitente and emitente.get("nome") else None
     m_titulo = re.search(r"T[IÍ]TULO\.+:\s*(\S+)", texto, re.IGNORECASE)
@@ -838,20 +1082,40 @@ def preparar_arquivo(caminho_prn, log=print):
         "blocos": blocos,
         "assinaturas_qualificadas": assinaturas_qualificadas,
         "deteccao_imoveis": deteccao_imoveis,
+        "tem_clausula_superveniencia": tem_clausula_superveniencia,
+        "cartorio_detectado": cartorio_detectado,
         "nome_emitente": nome_emitente,
         "numero_titulo": numero_titulo,
     }
 
 
-def finalizar_geracao(dados, pasta_saida, texto_revisao_imoveis=None, log=print):
-    """Aplica a correcao da secao de imoveis (se houver texto revisado) e
-    gera o Word."""
+def finalizar_geracao(dados, pasta_saida, texto_revisao_imoveis=None, checkbox_superveniencia=None, log=print):
+    """Aplica a correcao da secao de imoveis (se houver texto revisado),
+    acrescenta a clausula de Superveniencia se o checkbox estiver marcado
+    E ela nao existia no documento original (evita duplicidade), e gera
+    o Word."""
     texto = dados["texto"]
+    posicao_fim_descricao = dados["deteccao_imoveis"]["span_fim"] if dados["deteccao_imoveis"] else None
+
     if dados["deteccao_imoveis"] and texto_revisao_imoveis is not None:
-        texto = aplicar_correcao_imoveis(texto, dados["deteccao_imoveis"], texto_revisao_imoveis)
         log("Aplicando correções da seção '2 - IMÓVEIS' ...")
-        # a secao de imoveis mudou de tamanho -- refaz blocos/assinaturas
-        # em cima do texto corrigido, pra qualificacao continuar correta.
+        texto, posicao_fim_descricao = aplicar_correcao_imoveis(texto, dados["deteccao_imoveis"], texto_revisao_imoveis)
+
+    # so acrescenta a clausula se: (a) o checkbox esta marcado agora, e
+    # (b) ela NAO existia no documento original -- se ja existia, nao
+    # precisa (evita duplicidade), mesmo que o checkbox continue marcado.
+    deve_acrescentar_clausula = (
+        checkbox_superveniencia
+        and not dados["tem_clausula_superveniencia"]
+        and posicao_fim_descricao is not None
+    )
+    if deve_acrescentar_clausula:
+        log("Acrescentando cláusula de Superveniência (marcada em azul no Word) ...")
+        texto = aplicar_clausula_superveniencia(texto, posicao_fim_descricao, adicionar=True)
+
+    if texto_revisao_imoveis is not None or deve_acrescentar_clausula:
+        # o texto mudou -- refaz blocos/assinaturas em cima do texto
+        # corrigido, pra qualificacao continuar correta.
         blocos = extrair_blocos_dados(texto)
         assinaturas_qualificadas = qualificar_com_blocos(extrair_assinaturas(texto), blocos)
     else:
@@ -886,10 +1150,13 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Qualificador de Cédulas")
-        self.geometry("700x560")
+        self.geometry("760x620")
         self.resizable(True, True)
 
         self.caminho_prn = tk.StringVar()
+        self.var_superveniencia = tk.BooleanVar(value=False)
+        self.var_cartorio = tk.StringVar()
+        self.var_procurador = tk.StringVar()
         self.dados_preparados = None  # resultado de preparar_arquivo()
 
         frame_top = tk.Frame(self, padx=12, pady=12)
@@ -909,19 +1176,64 @@ class App(tk.Tk):
         )
         self.botao_gerar.pack(side="left", padx=(8, 0), pady=6)
 
-        # -------- painel de revisao da secao "2 - IMOVEIS" (aparece só quando aplicável) --------
-        self.frame_revisao = tk.LabelFrame(
-            self, text="Revisão: seção \"2 - IMÓVEIS\" (edite abaixo se precisar corrigir)", padx=8, pady=8
-        )
-        self.aviso_label = tk.Label(self.frame_revisao, text="", fg="#b71c1c", justify="left")
+        # -------- abas --------
+        self.abas = ttk.Notebook(self)
+        self.abas.pack(fill="both", expand=True, padx=12, pady=(6, 6))
+
+        self._montar_aba_descricao()
+        self._montar_aba_opcoes()
+
+        self.log_text = scrolledtext.ScrolledText(self, padx=8, pady=8, state="disabled", wrap="word", height=8)
+        self.log_text.pack(fill="both", expand=False, padx=12, pady=(0, 12))
+
+    # ------------------------------------------------------------------
+    # montagem das abas
+    # ------------------------------------------------------------------
+    def _montar_aba_descricao(self):
+        aba = tk.Frame(self.abas, padx=8, pady=8)
+        self.abas.add(aba, text="Descrição da Matrícula")
+
+        self.aviso_label = tk.Label(aba, text="", fg="#b71c1c", justify="left", anchor="w")
         self.aviso_label.pack(fill="x", anchor="w")
-        self.texto_revisao = scrolledtext.ScrolledText(self.frame_revisao, height=8, wrap="word")
-        self.texto_revisao.pack(fill="both", expand=True, pady=(4, 0))
-        # o frame_revisao só é exibido (pack) quando ha algo pra revisar
 
-        self.log_text = scrolledtext.ScrolledText(self, padx=8, pady=8, state="disabled", wrap="word", height=10)
-        self.log_text.pack(fill="both", expand=True, padx=12, pady=(6, 12))
+        tk.Label(
+            aba, text="Descrição do imóvel (seção \"2 - IMÓVEIS\") -- edite aqui se precisar corrigir:",
+            anchor="w", justify="left",
+        ).pack(fill="x", anchor="w", pady=(6, 2))
 
+        self.texto_revisao = scrolledtext.ScrolledText(aba, height=16, wrap="word")
+        self.texto_revisao.pack(fill="both", expand=True)
+
+    def _montar_aba_opcoes(self):
+        aba = tk.Frame(self.abas, padx=12, pady=12)
+        self.abas.add(aba, text="Opções")
+
+        frame_superveniencia = tk.Frame(aba)
+        frame_superveniencia.pack(fill="x", anchor="w", pady=(0, 4))
+        self.check_superveniencia = tk.Checkbutton(
+            frame_superveniencia, text="Cláusula de Superveniência", variable=self.var_superveniencia,
+        )
+        self.check_superveniencia.pack(side="left")
+        self.label_status_superveniencia = tk.Label(frame_superveniencia, text="", fg="#555555")
+        self.label_status_superveniencia.pack(side="left", padx=(8, 0))
+
+        tk.Label(
+            aba,
+            text="Se desmarcado ao processar, a cláusula não foi encontrada na cédula -- marque\n"
+                 "para acrescentá-la (aparece em azul no Word gerado). Se já existir, marcar de\n"
+                 "novo não duplica.",
+            fg="#555555", justify="left", anchor="w",
+        ).pack(fill="x", anchor="w", pady=(0, 12))
+
+        tk.Label(aba, text="Cartório:").pack(anchor="w")
+        self.combo_cartorio = ttk.Combobox(aba, textvariable=self.var_cartorio, values=[], width=60)
+        self.combo_cartorio.pack(fill="x", anchor="w", pady=(0, 12))
+
+        tk.Label(aba, text="Procuradores:").pack(anchor="w")
+        self.combo_procurador = ttk.Combobox(aba, textvariable=self.var_procurador, values=[], width=60)
+        self.combo_procurador.pack(fill="x", anchor="w")
+
+    # ------------------------------------------------------------------
     def log(self, mensagem):
         self.log_text.configure(state="normal")
         self.log_text.insert("end", mensagem + "\n")
@@ -945,7 +1257,6 @@ class App(tk.Tk):
 
         self.botao_processar.config(state="disabled")
         self.botao_gerar.config(state="disabled")
-        self.frame_revisao.pack_forget()
         self.log_text.configure(state="normal")
         self.log_text.delete("1.0", "end")
         self.log_text.configure(state="disabled")
@@ -954,6 +1265,7 @@ class App(tk.Tk):
             self.dados_preparados = preparar_arquivo(caminho, log=self.log)
             deteccao = self.dados_preparados["deteccao_imoveis"]
 
+            self.texto_revisao.delete("1.0", "end")
             if deteccao:
                 avisos = []
                 if deteccao["tem_hipoteca"]:
@@ -963,14 +1275,27 @@ class App(tk.Tk):
                 if not avisos:
                     avisos.append("Nenhum problema encontrado -- revise/ajuste os valores abaixo se quiser.")
                 self.aviso_label.config(text="\n".join(avisos))
-
-                self.texto_revisao.delete("1.0", "end")
                 self.texto_revisao.insert("1.0", montar_texto_revisao(deteccao))
-                self.frame_revisao.pack(fill="both", expand=False, padx=12, pady=(0, 6))
             else:
-                self.log("  (Documento não tem seção '2 - IMÓVEIS' -- nada para revisar aqui.)")
+                self.aviso_label.config(text="Documento não tem seção \"2 - IMÓVEIS\" -- nada para revisar aqui.")
 
-            self.log("\nProcessado. Confira acima (e o painel de revisão, se apareceu) e clique em \"2. Gerar Word\".")
+            # aba Opcoes: clausula de superveniencia
+            tem_clausula = self.dados_preparados["tem_clausula_superveniencia"]
+            self.var_superveniencia.set(tem_clausula)
+            self.label_status_superveniencia.config(
+                text="(encontrada na cédula)" if tem_clausula else "(não encontrada -- marque para acrescentar)"
+            )
+
+            # aba Opcoes: cartorio detectado
+            cartorio = self.dados_preparados["cartorio_detectado"]
+            if cartorio:
+                self.combo_cartorio.config(values=[cartorio])
+                self.var_cartorio.set(cartorio)
+            else:
+                self.combo_cartorio.config(values=[])
+                self.var_cartorio.set("")
+
+            self.log("\nProcessado. Confira as abas acima e clique em \"2. Gerar Word\".")
             self.botao_gerar.config(state="normal")
         except Exception as e:
             self.log("\nERRO: " + str(e))
@@ -992,7 +1317,11 @@ class App(tk.Tk):
 
             pasta_saida = os.path.dirname(self.caminho_prn.get().strip())
             caminho_saida = finalizar_geracao(
-                self.dados_preparados, pasta_saida, texto_revisao_imoveis=texto_revisao, log=self.log
+                self.dados_preparados,
+                pasta_saida,
+                texto_revisao_imoveis=texto_revisao,
+                checkbox_superveniencia=self.var_superveniencia.get(),
+                log=self.log,
             )
             self.log("\nConcluído com sucesso!")
             resposta = messagebox.askyesno(
