@@ -22,6 +22,11 @@ import traceback
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
+try:
+    import openpyxl
+except ImportError:
+    openpyxl = None
+
 from docx import Document
 from docx.shared import Cm, Pt, Emu, RGBColor
 from docx.enum.text import WD_LINE_SPACING, WD_TAB_ALIGNMENT, WD_ALIGN_PARAGRAPH
@@ -116,7 +121,8 @@ ROTULOS_BLOCO_DADOS = [
     ("FIDUCIANTE", r"Propriet[aá]rio\(s\):"),
 ]
 
-CPF_RE = re.compile(r"CPF\.?:?\s*(?:sob\s*n[°.]?\s*)?([\d.\-]{11,})", re.IGNORECASE)
+CPF_RE = re.compile(r"CPF\.{0,20}:?\s*(?:sob\s*n[°.]?\s*)?([\d.\-]{11,})", re.IGNORECASE)
+CNPJ_RE = re.compile(r"CNPJ\.{0,20}:?\s*([\d./\-]{14,})", re.IGNORECASE)
 RG_RE = re.compile(r"\bRG\s*([\w./-]+)\s*-\s*([A-Z/]+)", re.IGNORECASE)
 NACIONALIDADE_RE = re.compile(r"Nacionalidade\s+([A-ZÀ-Ú]+)", re.IGNORECASE)
 ESTADO_CIVIL_RE = re.compile(r"Nacionalidade\s+\S+,\s*([A-ZÀ-Ú]+)", re.IGNORECASE)
@@ -126,6 +132,8 @@ PROFISSAO_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 ENDERECO_RE = re.compile(r"residente\s+e\s+domiciliado\(a\)\s+no\(a\)\s*(.+?),\s*bairro\s*(.+?),", re.IGNORECASE | re.DOTALL)
+# PJ usa "com sede no(a)..." em vez de "residente e domiciliado(a) no(a)..."
+ENDERECO_PJ_RE = re.compile(r"com\s+sede\s+no\(a\)\s*(.+?),\s*bairro\s*(.+?),", re.IGNORECASE | re.DOTALL)
 TELEFONE_RE = re.compile(r"telefone\s*(.+?),", re.IGNORECASE | re.DOTALL)
 EMAIL_RE = re.compile(r"endere[çc]o\s+eletr[ôo]nico\s*(.+?)\.\s*$", re.IGNORECASE | re.DOTALL)
 
@@ -141,16 +149,20 @@ def _fim_do_paragrafo(texto, inicio, limite):
 
 def _extrair_campos(bloco_completo):
     cpf_m = CPF_RE.search(bloco_completo)
+    cnpj_m = CNPJ_RE.search(bloco_completo)
+    eh_pj = cnpj_m is not None and cpf_m is None
     rg_m = RG_RE.search(bloco_completo)
     nac_m = NACIONALIDADE_RE.search(bloco_completo)
     ec_m = ESTADO_CIVIL_RE.search(bloco_completo)
     fil_m = FILIACAO_RE.search(bloco_completo)
     prof_m = PROFISSAO_RE.search(bloco_completo)
-    end_m = ENDERECO_RE.search(bloco_completo)
+    end_m = ENDERECO_RE.search(bloco_completo) or (ENDERECO_PJ_RE.search(bloco_completo) if eh_pj else None)
     tel_m = TELEFONE_RE.search(bloco_completo)
     email_m = EMAIL_RE.search(bloco_completo)
     return {
+        "eh_pj": eh_pj,
         "cpf": cpf_m.group(1) if cpf_m else None,
+        "cnpj": cnpj_m.group(1) if cnpj_m else None,
         "rg": rg_m.group(1) if rg_m else None,
         "orgao_emissor": rg_m.group(2) if rg_m else None,
         "nacionalidade": nac_m.group(1) if nac_m else None,
@@ -205,11 +217,46 @@ CABECALHOS_ASSINATURA = [
     ("INTERVENIENTE_GARANTIDOR", r"^[ \t]*INTERVENIENTE\(S\)\s+GARANTIDOR\(ES\):"),
 ]
 
-CPF_ASSINATURA_RE = re.compile(r"\bCPF\.?:?\s*([\d.\-]{11,})", re.IGNORECASE)
+CPF_ASSINATURA_RE = re.compile(r"\bCPF\.{0,20}:?\s*([\d.\-]{11,})", re.IGNORECASE)
 AUTORIZACAO_CONJUGE_RE = re.compile(
     r"Autoriza[çc][aã]o\s+para\s+os\s+fins\s+do\s*\r?\n?\s*Art\.\s*1\.647\s+do\s+C[oó]digo\s+Civil",
     re.IGNORECASE,
 )
+# rotulo "Interveniente(s) Garantidor(es)" SOZINHO (sem dois pontos no
+# fim), que pode aparecer no meio de outro bloco (ex: dentro do
+# EMITENTE(S), quando quem assina como interveniente nao e o emitente).
+# Diferente de CABECALHOS_ASSINATURA (que exige ":" no fim e vira o
+# papel "oficial" da secao), esse so troca o papel DAQUELA assinatura
+# especifica, sem mudar o rastreamento do resto do documento.
+PADRAO_INTERVENIENTE_LABEL_SOLTO = re.compile(
+    r"^[ \t]*Interveniente\(s\)\s+Garantidor\(es\)[ \t]*:?[ \t]*$", re.IGNORECASE | re.MULTILINE
+)
+
+
+PADRAO_RAZAO_SOCIAL = re.compile(r"Raz[ãa]o\s+Social:\s*(.+)", re.IGNORECASE)
+
+
+def _proxima_linha_assinatura(linhas_flat, indice):
+    """A partir de indice, pula linhas em branco e marcadores de
+    paginacao (a assinatura pode atravessar quebra de pagina -- ex:
+    'Razao Social:' numa pagina e o 'CNPJ' na seguinte) procurando a
+    proxima linha com conteudo real. Para e devolve (None, indice) se
+    encontrar OUTRO sublinhado (comeco de nova assinatura)."""
+    j = indice
+    while j < len(linhas_flat):
+        texto_j = linhas_flat[j]["texto"]
+        if PADRAO_UNDERLINE.match(texto_j):
+            return None, j
+        eh_pag = (
+            PADRAO_CONTINUA_PROXIMA.search(texto_j)
+            or PADRAO_CONTINUACAO_HEADER.search(texto_j)
+            or PADRAO_PAGINA_SOZINHA.match(texto_j)
+        )
+        if texto_j.strip() == "" or eh_pag:
+            j += 1
+            continue
+        return linhas_flat[j], j
+    return None, j
 
 
 def extrair_assinaturas(texto):
@@ -228,20 +275,38 @@ def extrair_assinaturas(texto):
                 break
         return papel
 
-    assinaturas = []
+    # junta as duas formas de assinatura -- PF ("NOME:") e PJ ("Razao
+    # Social:") -- numa unica lista ordenada por posicao no texto
+    ocorrencias = []
     for m in re.finditer(r"\bNOME:\s*(.+)", texto, re.IGNORECASE):
-        nome = m.group(1).strip()
-        pos = m.start()
-        janela = texto[pos:pos + 200]
-        cpf_m = CPF_ASSINATURA_RE.search(janela)
-        cpf = cpf_m.group(1) if cpf_m else None
+        ocorrencias.append((m.start(), False, m.group(1).strip()))
+    for m in re.finditer(PADRAO_RAZAO_SOCIAL, texto):
+        ocorrencias.append((m.start(), True, m.group(1).strip()))
+    ocorrencias.sort(key=lambda o: o[0])
+
+    assinaturas = []
+    for pos, eh_pj, nome in ocorrencias:
+        janela = texto[pos:pos + 250]
+        if eh_pj:
+            doc_m = CNPJ_RE.search(janela)
+        else:
+            doc_m = CPF_ASSINATURA_RE.search(janela)
+        documento = doc_m.group(1) if doc_m else None
         contexto_anterior = texto[max(0, pos - 150):pos]
         eh_autorizacao_conjuge = bool(AUTORIZACAO_CONJUGE_RE.search(contexto_anterior))
+        eh_interveniente_local = bool(PADRAO_INTERVENIENTE_LABEL_SOLTO.search(contexto_anterior))
+
+        papel = papel_na_posicao(pos)
+        if eh_interveniente_local and not eh_autorizacao_conjuge:
+            papel = "INTERVENIENTE_GARANTIDOR"
+
         assinaturas.append({
-            "papel_assinatura": papel_na_posicao(pos),
+            "papel_assinatura": papel,
             "autorizacao_conjuge_art_1647": eh_autorizacao_conjuge,
+            "eh_pj": eh_pj,
             "nome": nome,
-            "cpf": cpf,
+            "cpf": None if eh_pj else documento,
+            "cnpj": documento if eh_pj else None,
         })
     return assinaturas
 
@@ -253,19 +318,21 @@ def papel_header_esperado(assinatura):
 
 
 def qualificar_com_blocos(assinaturas, blocos):
-    blocos_por_cpf_e_papel = {}
-    blocos_por_cpf_qualquer = {}
+    blocos_por_doc_e_papel = {}
+    blocos_por_doc_qualquer = {}
     for b in blocos:
-        if not b["cpf"]:
+        documento = b.get("cnpj") or b.get("cpf")
+        if not documento:
             continue
-        blocos_por_cpf_e_papel[(b["cpf"], b["papel"])] = b
-        blocos_por_cpf_qualquer.setdefault(b["cpf"], b)
+        blocos_por_doc_e_papel[(documento, b["papel"])] = b
+        blocos_por_doc_qualquer.setdefault(documento, b)
 
     qualificadas = []
     for assinatura in assinaturas:
+        documento = assinatura.get("cnpj") or assinatura.get("cpf")
         papel_esperado = papel_header_esperado(assinatura)
-        dados_exatos = blocos_por_cpf_e_papel.get((assinatura["cpf"], papel_esperado))
-        dados_completos = dados_exatos or blocos_por_cpf_qualquer.get(assinatura["cpf"])
+        dados_exatos = blocos_por_doc_e_papel.get((documento, papel_esperado))
+        dados_completos = dados_exatos or blocos_por_doc_qualquer.get(documento)
         qualificadas.append({
             **assinatura,
             "encontrado_no_cabecalho": dados_completos is not None,
@@ -296,11 +363,22 @@ def _normalizar_espacos(s):
     return re.sub(r"\s+", " ", s).strip()
 
 
+PADRAO_TEXTO_COPIA_MATRICULA = re.compile(
+    r"A\s+c[óo]pia\s+das\s+referidas\s+matr[íi]culas\s+fazem\s+parte\s+integrante\s+e\s+"
+    r"insepar[áa]vel\s+desta\s+C[ée]dula,\s*para\s+todos\s+os\s+fins\s+e\s+efeitos,\s*"
+    r"como\s+se\s+aqui\s+estivesse\s+integralmente\s+transcritas\.",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
 def _remover_boilerplate_paginacao(bloco):
     """Remove as linhas de paginacao (Continua Proxima Pagina /
     Continuacao do instrumento... / Pagina: N sozinha) de dentro de um
     trecho de texto -- usado pra descricao do imovel nao "puxar" esses
-    artefatos quando a secao atravessa mais de uma pagina do PRN."""
+    artefatos quando a secao atravessa mais de uma pagina do PRN. Tambem
+    remove a frase fixa "A copia das referidas matriculas..." que nao e
+    parte da descricao do imovel em si."""
+    bloco = PADRAO_TEXTO_COPIA_MATRICULA.sub("", bloco)
     linhas = bloco.split("\n")
     linhas_limpas = [
         l for l in linhas
@@ -366,6 +444,180 @@ def detectar_secao_imoveis(texto):
         "valores_avaliacao": valores,
         "avaliacoes_duplicadas": duplicado,
     }
+
+
+# --------------------------------------------------------------------
+# Hipoteca Cedular -- mesma ideia da secao "2 - IMOVEIS", mas pro outro
+# tipo de garantia (cedula rural hipotecaria). O PRN as vezes duplica um
+# trecho inteiro dentro dessa clausula (bug de geracao do lado deles) --
+# detectamos e removemos a repeticao automaticamente.
+# --------------------------------------------------------------------
+
+PADRAO_SECAO_HIPOTECA = re.compile(
+    r"HIPOTECA\s+CEDULAR\s*-\s*Em\s+seguran[çc]a\s+das\s+obriga[çc][õo]es\s+contratadas,",
+    re.IGNORECASE,
+)
+PADRAO_FIM_SECAO_HIPOTECA = re.compile(
+    r"Al[ée]m\s+das\s+declara[çc][õo]es\s+j[áa]\s+prestadas", re.IGNORECASE
+)
+
+
+def _remover_duplicacao_consecutiva(texto, tamanho_minimo=30):
+    """Detecta se um trecho substancial de texto se repete duas vezes
+    SEGUIDAS (bug conhecido na geracao do PRN pelo sistema de origem --
+    ex: endereco do avalista duplicado dentro da clausula de hipoteca) e
+    remove a repeticao, mantendo so uma ocorrencia. So mexe se achar
+    uma repeticao de verdade; se nao achar, devolve o texto igual."""
+    palavras = texto.split()
+    n = len(palavras)
+    melhor = None
+    for tam in range(n // 2, 3, -1):
+        for inicio in range(0, n - 2 * tam + 1):
+            bloco1 = palavras[inicio:inicio + tam]
+            bloco2 = palavras[inicio + tam:inicio + 2 * tam]
+            if bloco1 == bloco2 and len(" ".join(bloco1)) >= tamanho_minimo:
+                melhor = (inicio, tam)
+                break
+        if melhor:
+            break
+    if not melhor:
+        return texto
+    inicio, tam = melhor
+    novas_palavras = palavras[:inicio + tam] + palavras[inicio + 2 * tam:]
+    return " ".join(novas_palavras)
+
+
+def detectar_secao_hipoteca(texto):
+    """Localiza a clausula 'HIPOTECA CEDULAR - Em seguranca das
+    obrigacoes contratadas, ...' e devolve o trecho (ja sem duplicacao,
+    se detectada) pronto pra revisao/edicao futura. Retorna None se a
+    cedula nao tiver esse tipo de garantia."""
+    m_inicio = PADRAO_SECAO_HIPOTECA.search(texto)
+    if not m_inicio:
+        return None
+
+    m_fim = PADRAO_FIM_SECAO_HIPOTECA.search(texto, m_inicio.end())
+    fim = m_fim.start() if m_fim else min(m_inicio.end() + 50000, len(texto))
+    bloco_bruto = _remover_boilerplate_paginacao(texto[m_inicio.start():fim])
+
+    bloco_sem_duplicacao = _remover_duplicacao_consecutiva(bloco_bruto)
+    tinha_duplicacao = bloco_sem_duplicacao != bloco_bruto
+
+    return {
+        "span_inicio": m_inicio.start(),
+        "span_fim": fim,
+        "bloco_original": bloco_bruto,
+        "bloco_sem_duplicacao": bloco_sem_duplicacao,
+        "tinha_duplicacao": tinha_duplicacao,
+    }
+
+
+def aplicar_correcao_hipoteca(texto, deteccao):
+    """Substitui o trecho original da clausula de hipoteca pela versao
+    sem duplicacao (mantem o mesmo recuo/formatacao do resto do
+    documento)."""
+    linhas_novas = []
+    for linha in deteccao["bloco_sem_duplicacao"].split("\n"):
+        linhas_novas.append("      " + linha.strip() if linha.strip() else "      ")
+    bloco_novo = "\r\n".join(linhas_novas)
+    return texto[:deteccao["span_inicio"]] + bloco_novo + texto[deteccao["span_fim"]:]
+
+
+# --------------------------------------------------------------------
+# Aba "Assinaturas" -- visualizacao/edicao de tudo que sai como
+# qualificacao de cada assinatura (emitente/avalista/PJ), num unico
+# texto editavel, delimitado por marcadores que dao pra editar,
+# remover (deixar em branco) ou acrescentar uma assinatura nova.
+# --------------------------------------------------------------------
+
+PADRAO_MARCADOR_ASSINATURA_PREVIEW = re.compile(
+    r"^-{3}\s*(\d+)\.\s*([^(]+?)\s*\(([^)]*)\)\s*-{3}\s*$", re.MULTILINE
+)
+
+
+def montar_texto_revisao_assinaturas(assinaturas_qualificadas):
+    """Monta o texto editavel da aba 'Assinaturas': um bloco por
+    assinatura, com o papel/documento no marcador e o texto completo
+    (o mesmo que vai ser usado na qualificacao) editavel embaixo."""
+    partes = []
+    for i, a in enumerate(assinaturas_qualificadas, start=1):
+        documento = a.get("cnpj") or a.get("cpf") or "sem documento"
+        papel = a["papel_assinatura"]
+        if a.get("autorizacao_conjuge_art_1647"):
+            papel += " - AUTORIZAÇÃO CÔNJUGE"
+        if a.get("eh_pj"):
+            papel += " (PJ)"
+        dados = a.get("dados_completos")
+        if dados and dados.get("bloco_sem_rotulo"):
+            linhas_originais = dados["bloco_sem_rotulo"].split("\r\n") if "\r\n" in dados["bloco_sem_rotulo"] else dados["bloco_sem_rotulo"].split("\n")
+            texto_bloco = _reflow_prosa(linhas_originais)
+        else:
+            texto_bloco = f"(NÃO ENCONTRADO NO CABEÇALHO -- nome: {a.get('nome') or '?'})"
+        partes.append(f"--- {i}. {papel} ({documento}) ---\n{texto_bloco}")
+    partes.append(
+        "--- NOVO: NOME DO PAPEL (documento) ---\n"
+        "(pra acrescentar uma assinatura que não veio no PRN, copie um bloco acima,\n"
+        "troque 'NOVO' por um número maior que os existentes, e preencha os dados)"
+    )
+    return "\n\n".join(partes)
+
+
+def analisar_texto_revisao_assinaturas(texto_editado):
+    """Le o texto (possivelmente editado) da aba 'Assinaturas' e devolve
+    uma lista ordenada de {indice, papel, documento, texto}. Blocos com
+    indice 'NOVO' ou nao numerico sao ignorados (o texto de exemplo no
+    fim), a nao ser que o colaborador tenha trocado por um numero."""
+    marcadores = list(PADRAO_MARCADOR_ASSINATURA_PREVIEW.finditer(texto_editado))
+    resultado = []
+    for idx, m in enumerate(marcadores):
+        inicio_texto = m.end()
+        fim_texto = marcadores[idx + 1].start() if idx + 1 < len(marcadores) else len(texto_editado)
+        corpo = texto_editado[inicio_texto:fim_texto].strip()
+        try:
+            indice_original = int(m.group(1))
+        except ValueError:
+            continue
+        resultado.append({
+            "indice_original": indice_original,
+            "papel": m.group(2).strip(),
+            "documento": m.group(3).strip(),
+            "texto": corpo,
+        })
+    return resultado
+
+
+def aplicar_revisao_assinaturas(texto, assinaturas_qualificadas, texto_editado, log=print):
+    """Aplica as edicoes da aba 'Assinaturas' -- sobrescreve o texto de
+    qualificacao de cada assinatura existente com o que foi editado, e
+    acrescenta como novas assinaturas (apos a ultima existente) qualquer
+    bloco com indice alem da quantidade original. Devolve o texto
+    (com as assinaturas novas inseridas, se houver -- as edicoes das
+    existentes sao aplicadas depois, sobre assinaturas_qualificadas)."""
+    entradas = analisar_texto_revisao_assinaturas(texto_editado)
+    total_original = len(assinaturas_qualificadas)
+
+    for entrada in entradas:
+        idx = entrada["indice_original"] - 1
+        if 0 <= idx < total_original:
+            dc = assinaturas_qualificadas[idx].get("dados_completos")
+            if dc is None:
+                dc = {}
+                assinaturas_qualificadas[idx]["dados_completos"] = dc
+            dc["bloco_sem_rotulo"] = entrada["texto"]
+
+    novas = [e for e in entradas if e["indice_original"] > total_original]
+    for nova in novas:
+        log(f"  Acrescentando assinatura nova: {nova['papel']} ({nova['documento']}) ...")
+        bloco = (
+            "\r\n      \r\n"
+            + "      " + "_" * 50 + "\r\n"
+            + "      " + MARCADOR_ADICIONADO_INICIO + nova["texto"] + MARCADOR_ADICIONADO_FIM + "\r\n"
+        )
+        pos = _posicao_apos_ultima_assinatura(texto)
+        if pos is not None:
+            texto = texto[:pos] + bloco + texto[pos:]
+
+    return texto
 
 
 def montar_texto_revisao(deteccao):
@@ -435,6 +687,15 @@ PADRAO_CLAUSULA_SUPERVENIENCIA = re.compile(
 MARCADOR_ADICIONADO_INICIO = "\ue000"
 MARCADOR_ADICIONADO_FIM = "\ue001"
 
+# modelo de representacao por socio, acrescentado apos os dados de uma
+# assinatura PJ -- o PRN nao traz nome/CPF do socio, entao fica com
+# asteriscos pro colaborador preencher manualmente (destacado em azul,
+# igual ao resto do que o script acrescenta)
+TEXTO_REPRESENTACAO_PJ = (
+    "Neste ato é representada por sua sócios **********, inscrita no CPF nº "
+    "**********, conforme disposto no contrato social."
+)
+
 
 def detectar_clausula_superveniencia(texto):
     """True se a clausula de superveniencia ja existe no documento."""
@@ -460,6 +721,21 @@ def aplicar_clausula_superveniencia(texto, posicao_insercao, adicionar):
     return texto[:posicao_insercao] + bloco + texto[posicao_insercao:]
 
 
+PADRAO_FIM_CLAUSULA_SUPERVENIENCIA = re.compile(r"II\s*-\s*CL[ÁA]USULAS", re.IGNORECASE)
+
+
+def remover_clausula_superveniencia(texto):
+    """Remove a clausula de superveniencia que ja existia no documento
+    original -- usada quando o checkbox vem marcado (a clausula foi
+    encontrada) e o colaborador desmarca, decidindo tirar ela da cedula."""
+    m_inicio = PADRAO_CLAUSULA_SUPERVENIENCIA.search(texto)
+    if not m_inicio:
+        return texto
+    m_fim = PADRAO_FIM_CLAUSULA_SUPERVENIENCIA.search(texto, m_inicio.end())
+    fim = m_fim.start() if m_fim else min(m_inicio.end() + 2000, len(texto))
+    return texto[:m_inicio.start()] + texto[fim:]
+
+
 # --------------------------------------------------------------------
 # Cartorio (aba "Opcoes") -- deteccao simples por enquanto; no futuro vai
 # cruzar com uma planilha de criterios por cartorio.
@@ -477,6 +753,177 @@ def detectar_cartorio(texto):
     Retorna None se nao encontrar nada parecido."""
     m = PADRAO_CARTORIO.search(texto)
     return _normalizar_espacos(m.group(0)) if m else None
+
+
+# --------------------------------------------------------------------
+# Procuradores (aba "Opcoes") -- le a planilha "Procuradores -
+# Cartorios.xlsx" que o colaborador mantem atualizada numa pasta
+# "documentos" do lado do programa (funciona bem com OneDrive
+# sincronizado nessa mesma pasta).
+# --------------------------------------------------------------------
+
+NOME_PLANILHA_PROCURADORES = "Procuradores - Cartórios.xlsx"
+NOME_PASTA_DOCUMENTOS = "documentos"
+
+TEXTO_CREDOR_BASE = (
+    "CREDOR: COOPERATIVA DE CREDITO POUPANCA E INVESTIMENTO DEXIS SICREDI DEXIS, "
+    "instituição financeira brasileira, CNPJ 79.342.069/0001-53 doravante denominada "
+    "CREDORA, estabelecida no(a) AVENIDA PARANA 891, na cidade de MARINGA/PR. "
+    "NESTE ATO REPRESENTADA POR SEUS PROCURADORES {procurador_1} E {procurador_2}"
+)
+
+
+def pasta_base_app():
+    """Pasta onde o programa esta rodando de verdade -- funciona tanto
+    rodando o .py direto quanto rodando o .exe empacotado (PyInstaller
+    onefile extrai pra uma pasta temporaria, entao precisa usar
+    sys.executable nesse caso, nao __file__)."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def pasta_documentos():
+    """Pasta 'documentos' do lado do programa, onde fica a planilha de
+    procuradores/cartorios. Cria a pasta se ainda nao existir, pra
+    aparecer pronta pro colaborador arrastar o arquivo pra dentro."""
+    caminho = os.path.join(pasta_base_app(), NOME_PASTA_DOCUMENTOS)
+    try:
+        os.makedirs(caminho, exist_ok=True)
+    except OSError:
+        pass
+    return caminho
+
+
+def caminho_planilha_procuradores():
+    return os.path.join(pasta_documentos(), NOME_PLANILHA_PROCURADORES)
+
+
+def ler_planilha_procuradores(log=print):
+    """Le a planilha de procuradores/cartorios e devolve uma lista de
+    agencias -- so as que tem PELO MENOS um procurador (1 ou 2)
+    completamente preenchido (nome, CPF e cargo). Devolve lista vazia
+    se a planilha nao existir ou o openpyxl nao estiver disponivel."""
+    if openpyxl is None:
+        log("  (openpyxl não instalado -- dropdown de Procuradores ficará vazio.)")
+        return []
+
+    caminho = caminho_planilha_procuradores()
+    if not os.path.isfile(caminho):
+        log(f"  Planilha de procuradores não encontrada em: {caminho}")
+        return []
+
+    try:
+        wb = openpyxl.load_workbook(caminho, data_only=True)
+        ws = wb.active
+        linhas = list(ws.iter_rows(values_only=True))
+    except Exception as e:
+        log(f"  AVISO: não consegui ler a planilha de procuradores ({e}).")
+        return []
+
+    if not linhas:
+        return []
+
+    cabecalho = [str(c).strip() if c else "" for c in linhas[0]]
+
+    def idx(nome_coluna):
+        for i, c in enumerate(cabecalho):
+            if c.lower() == nome_coluna.lower():
+                return i
+        return None
+
+    col_codigo = idx("Código Agência")
+    col_agencia = idx("Agência")
+    col_nome1, col_cpf1, col_cargo1 = idx("Nome do Procurador - 1"), idx("CPF - 1"), idx("CARGO - 1")
+    col_nome2, col_cpf2, col_cargo2 = idx("Nome do Procurador - 2"), idx("CPF - 2"), idx("CARGO - 2")
+
+    def valor(linha, col):
+        if col is None or col >= len(linha) or linha[col] is None:
+            return ""
+        return str(linha[col]).strip()
+
+    agencias = []
+    for linha in linhas[1:]:
+        if linha is None or all(c is None for c in linha):
+            continue
+        codigo = valor(linha, col_codigo)
+        agencia = valor(linha, col_agencia)
+        proc1 = {"nome": valor(linha, col_nome1), "cpf": valor(linha, col_cpf1), "cargo": valor(linha, col_cargo1)}
+        proc2 = {"nome": valor(linha, col_nome2), "cpf": valor(linha, col_cpf2), "cargo": valor(linha, col_cargo2)}
+        proc1_completo = all(proc1.values())
+        proc2_completo = all(proc2.values())
+        if not (proc1_completo or proc2_completo):
+            continue  # nenhum procurador preenchido -- nao aparece pra selecionar
+        agencias.append({
+            "codigo": codigo,
+            "agencia": agencia,
+            "rotulo": f"{codigo} - {agencia}",
+            "procurador_1": proc1 if proc1_completo else None,
+            "procurador_2": proc2 if proc2_completo else None,
+        })
+    return agencias
+
+
+def montar_texto_credor_procuradores(agencia):
+    """Monta a linha 'CREDOR: ...' com os dados do(s) procurador(es) da
+    agencia selecionada, pronta pra entrar como assinatura apos o
+    ultimo campo de assinatura da cedula."""
+    def formatar(proc):
+        if not proc:
+            return None
+        return f"{proc['nome']}, inscrito(a) no CPF nº {proc['cpf']}, {proc['cargo']}"
+
+    p1 = formatar(agencia.get("procurador_1"))
+    p2 = formatar(agencia.get("procurador_2"))
+    if p1 and p2:
+        texto = TEXTO_CREDOR_BASE.format(procurador_1=p1, procurador_2=p2)
+    elif p1:
+        texto = TEXTO_CREDOR_BASE.replace(" E {procurador_2}", "").format(procurador_1=p1)
+    elif p2:
+        texto = TEXTO_CREDOR_BASE.replace("{procurador_1} E ", "").format(procurador_2=p2)
+    else:
+        texto = TEXTO_CREDOR_BASE.replace(" NESTE ATO REPRESENTADA POR SEUS PROCURADORES {procurador_1} E {procurador_2}", "")
+    return texto
+
+
+def _posicao_apos_ultima_assinatura(texto):
+    """Acha a posicao logo apos o NOME/Razao Social + CPF/CNPJ do
+    ULTIMO campo de assinatura existente no texto -- usada tanto pra
+    acrescentar a assinatura do procurador quanto novas assinaturas
+    vindas da aba de revisao. Devolve None se nao achar nenhuma."""
+    ultima_pos = 0
+    for m in re.finditer(r"\bNOME:\s*.+|\bRaz[ãa]o\s+Social:\s*.+", texto, re.IGNORECASE):
+        ultima_pos = m.end()
+    if ultima_pos == 0:
+        return None
+
+    # avanca ate o fim da linha do CPF/CNPJ que segue o NOME/Razao Social
+    fim_linha_doc_m = re.search(r"\r?\n", texto[ultima_pos:])
+    pos_insercao = ultima_pos + fim_linha_doc_m.end() if fim_linha_doc_m else ultima_pos
+    m_doc = re.search(r"\bCPF[\.\s:]*[\d.\-]+|\bCNPJ[\.\s:]*[\d./\-]+", texto[pos_insercao:pos_insercao + 200], re.IGNORECASE)
+    if m_doc:
+        fim_doc_linha = re.search(r"\r?\n", texto[pos_insercao + m_doc.end():])
+        if fim_doc_linha:
+            pos_insercao = pos_insercao + m_doc.end() + fim_doc_linha.end()
+    return pos_insercao
+
+
+def aplicar_assinatura_procurador(texto, agencia):
+    """Acrescenta o campo de assinatura da CREDORA (representada pelos
+    procuradores da agencia escolhida) logo apos o ultimo campo de
+    assinatura existente na cedula, marcado em azul (acrescentado pelo
+    script)."""
+    pos_insercao = _posicao_apos_ultima_assinatura(texto)
+    if pos_insercao is None:
+        return texto
+
+    texto_credor = montar_texto_credor_procuradores(agencia)
+    bloco = (
+        "\r\n      \r\n"
+        + "      " + "_" * 50 + "\r\n"
+        + "      " + MARCADOR_ADICIONADO_INICIO + texto_credor + MARCADOR_ADICIONADO_FIM + "\r\n"
+    )
+    return texto[:pos_insercao] + bloco + texto[pos_insercao:]
 
 
 
@@ -528,6 +975,30 @@ PADRAO_CABECALHO_TABELA = re.compile(r"^(Nro\s+Data|Ref\.BACEN|Quadro\s+Resumo\s
 # numeracao de clausula/item no comeco da linha (1., 3., (iii), a), i.) --
 # sozinha ja cria um "gap" de varios espacos que nao e uma tabela de verdade
 PADRAO_NUMERACAO_CLAUSULA = re.compile(r"^\s*(?:\(?[ivxlcdm]{1,6}\)|\(?[a-zA-Z]\)|\d+[.\)])\s+", re.IGNORECASE)
+
+# linha de parcela (Nro, Data, Valor, Percentual) -- usado pra separar
+# quando o PRN concatena mais de uma parcela na mesma linha fisica
+PADRAO_LINHA_PARCELA = re.compile(
+    r"(\d+)\s+(\d{2}/\d{2}/\d{4})\s+([\d.]+,\d{2})\s+([\d]+,\d{2})"
+)
+
+
+def _dividir_linhas_parcela_concatenadas(linhas_pagina):
+    """Quando ha mais de uma parcela prevista de liberacao, o PRN as
+    vezes concatena todas na MESMA linha fisica (ex: '1 DATA VALOR PCT
+    2 DATA VALOR PCT' tudo junto, sem quebra de linha entre elas) --
+    detecta isso e separa cada parcela na sua propria linha, no mesmo
+    formato de coluna da primeira."""
+    resultado = []
+    for linha in linhas_pagina:
+        ocorrencias = list(PADRAO_LINHA_PARCELA.finditer(linha))
+        if len(ocorrencias) >= 2:
+            for m in ocorrencias:
+                nro, data, valor, pct = m.groups()
+                resultado.append(f"        {nro}   {data}            {valor}           {pct}")
+        else:
+            resultado.append(linha)
+    return resultado
 
 
 def _reflow_prosa(linhas_texto):
@@ -709,7 +1180,9 @@ def gerar_docx(texto, blocos, assinaturas_qualificadas, caminho_saida):
     for pagina in paginas_textos:
         offsets_paginas.append(offset)
         offset += len(pagina) + 1  # +1 pelo \x0c removido no split
-        paginas_linhas.append([l.replace("\r", "") for l in pagina.replace("\r\n", "\n").split("\n")])
+        linhas_pagina = [l.replace("\r", "") for l in pagina.replace("\r\n", "\n").split("\n")]
+        linhas_pagina = _dividir_linhas_parcela_concatenadas(linhas_pagina)
+        paginas_linhas.append(linhas_pagina)
 
     while paginas_linhas and all(l.strip() == "" for l in paginas_linhas[-1]):
         paginas_linhas.pop()
@@ -771,13 +1244,19 @@ def gerar_docx(texto, blocos, assinaturas_qualificadas, caminho_saida):
             continue
 
         # junta linhas nao-vazias consecutivas em um bloco, pra classificar
-        # (para tambem nos marcadores de paginacao, que ficam sempre isolados)
+        # (para tambem nos marcadores de paginacao, que ficam sempre
+        # isolados, E quando o bloco comeca com um sublinhado de
+        # assinatura, tambem para ao achar OUTRO sublinhado -- senao,
+        # quando duas assinaturas vem coladas sem linha em branco entre
+        # elas, a segunda fica perdida dentro do bloco da primeira)
+        eh_bloco_assinatura = bool(PADRAO_UNDERLINE.match(atual["texto"]))
         bloco = [atual]
         j = i + 1
         while j < len(linhas_flat) and linhas_flat[j]["texto"].strip() != "" and not (
             PADRAO_CONTINUA_PROXIMA.search(linhas_flat[j]["texto"])
             or PADRAO_CONTINUACAO_HEADER.search(linhas_flat[j]["texto"])
             or PADRAO_PAGINA_SOZINHA.match(linhas_flat[j]["texto"])
+            or (eh_bloco_assinatura and PADRAO_UNDERLINE.match(linhas_flat[j]["texto"]))
         ):
             bloco.append(linhas_flat[j])
             j += 1
@@ -790,13 +1269,45 @@ def gerar_docx(texto, blocos, assinaturas_qualificadas, caminho_saida):
             if resto and PADRAO_AUTORIZACAO_UMA_LINHA.search(resto[0]["texto"]):
                 linhas_bloco.append({**resto[0], "texto": resto[0]["texto"].strip()})
                 resto = resto[1:]
-            if resto and re.search(r"\bNOME:\s*.+", resto[0]["texto"], re.IGNORECASE):
-                linha_nome = resto[0]
-                linha_cpf = resto[1] if len(resto) > 1 else None
-                tem_cpf = linha_cpf is not None and re.match(r"^\s*CPF", linha_cpf["texto"], re.IGNORECASE)
+            # rotulo solto "Interveniente(s) Garantidor(es)" (sem ":"),
+            # que pode aparecer sozinho dentro de outro bloco (ex: dentro
+            # do EMITENTE(S)) -- mantem visivel e avanca, senao a leitura
+            # sequencial trava aqui e o Nome/CPF seguintes ficam perdidos
+            # (e todas as assinaturas depois saem deslocadas/erradas).
+            if resto and PADRAO_INTERVENIENTE_LABEL_SOLTO.match(resto[0]["texto"].strip()):
+                linhas_bloco.append({**resto[0], "texto": resto[0]["texto"].strip()})
+                resto = resto[1:]
+            # a partir daqui, busca as proximas linhas "de verdade" pulando
+            # linhas em branco e marcadores de paginacao (a assinatura pode
+            # atravessar quebra de pagina -- ex: "Razao Social:" numa
+            # pagina e o "CNPJ" na seguinte). Para se achar OUTRO sublinhado.
+            cursor = i + 1
+            linha, cursor = _proxima_linha_assinatura(linhas_flat, cursor)
+
+            if linha and PADRAO_AUTORIZACAO_UMA_LINHA.search(linha["texto"]):
+                linhas_bloco.append({**linha, "texto": linha["texto"].strip()})
+                cursor += 1
+                linha, cursor = _proxima_linha_assinatura(linhas_flat, cursor)
+
+            if linha and PADRAO_INTERVENIENTE_LABEL_SOLTO.match(linha["texto"].strip()):
+                linhas_bloco.append({**linha, "texto": linha["texto"].strip()})
+                cursor += 1
+                linha, cursor = _proxima_linha_assinatura(linhas_flat, cursor)
+
+            eh_pj_aqui = linha is not None and PADRAO_RAZAO_SOCIAL.search(linha["texto"])
+            eh_pf_aqui = linha is not None and re.search(r"\bNOME:\s*.+", linha["texto"], re.IGNORECASE)
+
+            if linha and (eh_pj_aqui or eh_pf_aqui):
+                linha_nome = linha
+                linha_doc, cursor_doc = _proxima_linha_assinatura(linhas_flat, cursor + 1)
+                if eh_pj_aqui:
+                    tem_doc = linha_doc is not None and re.search(r"CNPJ", linha_doc["texto"], re.IGNORECASE)
+                else:
+                    tem_doc = linha_doc is not None and re.match(r"^\s*CPF", linha_doc["texto"], re.IGNORECASE)
+
                 assinatura = assinaturas_qualificadas[indice_assinatura] if indice_assinatura < len(assinaturas_qualificadas) else None
 
-                if assinatura and tem_cpf:
+                if assinatura and tem_doc:
                     indice_assinatura += 1
                     dados = assinatura["dados_completos"]
                     bloco_texto = dados.get("bloco_sem_rotulo") if dados else None
@@ -804,13 +1315,29 @@ def gerar_docx(texto, blocos, assinaturas_qualificadas, caminho_saida):
                         linhas_originais = bloco_texto.split("\r\n") if "\r\n" in bloco_texto else bloco_texto.split("\n")
                         texto_reflow = _reflow_prosa(linhas_originais)
                         linhas_bloco.append({"texto": texto_reflow, "quebra_forcada": False, "fonte_menor": atual["fonte_menor"]})
+                        # PJ: acrescenta o modelo de representacao por socio
+                        # (com asteriscos pro colaborador preencher -- o PRN
+                        # nao traz nome/CPF do socio), marcado em azul
+                        if assinatura.get("eh_pj"):
+                            linhas_bloco.append({
+                                "texto": MARCADOR_ADICIONADO_INICIO + TEXTO_REPRESENTACAO_PJ + MARCADOR_ADICIONADO_FIM,
+                                "quebra_forcada": False, "fonte_menor": atual["fonte_menor"],
+                            })
                     else:
                         linhas_bloco.append(linha_nome)
-                        linhas_bloco.append(linha_cpf)
+                        if linha_doc:
+                            linhas_bloco.append(linha_doc)
+                    j = cursor_doc + 1 if tem_doc else cursor + 1
                 else:
                     linhas_bloco.append(linha_nome)
-                    if tem_cpf:
-                        linhas_bloco.append(linha_cpf)
+                    if tem_doc:
+                        linhas_bloco.append(linha_doc)
+                    j = cursor_doc + 1 if tem_doc else cursor + 1
+            else:
+                # nao achou Nome/Razao Social (proximo sublinhado ou fim do
+                # documento) -- retoma dali, sem consumir nada a mais
+                j = cursor
+
             unidades.append({"tipo": "bloco", "linhas": linhas_bloco, "quebra_forcada": atual["quebra_forcada"]})
 
         elif tipo == "tabular":
@@ -830,6 +1357,7 @@ def gerar_docx(texto, blocos, assinaturas_qualificadas, caminho_saida):
                 "tipo": "linha",
                 "linha": {"texto": texto_reflow, "quebra_forcada": atual["quebra_forcada"], "fonte_menor": atual["fonte_menor"]},
             })
+            j = j  # (mantem o j calculado no agrupamento inicial do bloco)
 
         i = j
 
@@ -1071,6 +1599,13 @@ def preparar_arquivo(caminho_prn, log=print):
     log(f"  Cláusula de Superveniência: {'encontrada' if tem_clausula_superveniencia else 'não encontrada'}.")
     log(f"  Cartório detectado: {cartorio_detectado or '(nenhum)'}")
 
+    deteccao_hipoteca = detectar_secao_hipoteca(texto)
+    if deteccao_hipoteca:
+        if deteccao_hipoteca["tinha_duplicacao"]:
+            log("  Hipoteca Cedular encontrada -- trecho duplicado detectado e será corrigido.")
+        else:
+            log("  Hipoteca Cedular encontrada (sem duplicação).")
+
     emitente = next((b for b in blocos if b["papel"] == "EMITENTE"), None)
     nome_emitente = emitente["nome"].strip() if emitente and emitente.get("nome") else None
     m_titulo = re.search(r"T[IÍ]TULO\.+:\s*(\S+)", texto, re.IGNORECASE)
@@ -1084,16 +1619,23 @@ def preparar_arquivo(caminho_prn, log=print):
         "deteccao_imoveis": deteccao_imoveis,
         "tem_clausula_superveniencia": tem_clausula_superveniencia,
         "cartorio_detectado": cartorio_detectado,
+        "deteccao_hipoteca": deteccao_hipoteca,
         "nome_emitente": nome_emitente,
         "numero_titulo": numero_titulo,
     }
 
 
-def finalizar_geracao(dados, pasta_saida, texto_revisao_imoveis=None, checkbox_superveniencia=None, log=print):
+def finalizar_geracao(
+    dados, pasta_saida, texto_revisao_imoveis=None, checkbox_superveniencia=None,
+    texto_revisao_assinaturas=None, agencia_procurador=None, log=print,
+):
     """Aplica a correcao da secao de imoveis (se houver texto revisado),
     acrescenta a clausula de Superveniencia se o checkbox estiver marcado
-    E ela nao existia no documento original (evita duplicidade), e gera
-    o Word."""
+    E ela nao existia no documento original (evita duplicidade), corrige
+    a Hipoteca Cedular se houver duplicacao, aplica a revisao manual das
+    assinaturas (se editada), acrescenta a assinatura da CREDORA
+    representada pelos procuradores da agencia escolhida (se houver), e
+    gera o Word."""
     texto = dados["texto"]
     posicao_fim_descricao = dados["deteccao_imoveis"]["span_fim"] if dados["deteccao_imoveis"] else None
 
@@ -1101,19 +1643,42 @@ def finalizar_geracao(dados, pasta_saida, texto_revisao_imoveis=None, checkbox_s
         log("Aplicando correções da seção '2 - IMÓVEIS' ...")
         texto, posicao_fim_descricao = aplicar_correcao_imoveis(texto, dados["deteccao_imoveis"], texto_revisao_imoveis)
 
-    # so acrescenta a clausula se: (a) o checkbox esta marcado agora, e
-    # (b) ela NAO existia no documento original -- se ja existia, nao
-    # precisa (evita duplicidade), mesmo que o checkbox continue marcado.
+    # 3 casos pro checkbox de Superveniencia:
+    #  - ja existia e continua marcado -> nao faz nada (evita duplicidade)
+    #  - ja existia e foi DESMARCADO -> remove a clausula do documento
+    #  - nao existia e foi marcado -> acrescenta (marcada em azul)
     deve_acrescentar_clausula = (
         checkbox_superveniencia
         and not dados["tem_clausula_superveniencia"]
         and posicao_fim_descricao is not None
     )
+    deve_remover_clausula = (
+        checkbox_superveniencia is False
+        and dados["tem_clausula_superveniencia"]
+    )
     if deve_acrescentar_clausula:
         log("Acrescentando cláusula de Superveniência (marcada em azul no Word) ...")
         texto = aplicar_clausula_superveniencia(texto, posicao_fim_descricao, adicionar=True)
+    elif deve_remover_clausula:
+        log("Removendo cláusula de Superveniência (desmarcada pelo colaborador) ...")
+        texto = remover_clausula_superveniencia(texto)
 
-    if texto_revisao_imoveis is not None or deve_acrescentar_clausula:
+    # Hipoteca Cedular: corrige duplicacao automaticamente, se houver.
+    # Redeteta em cima do texto ATUAL (nao o original) pra nao usar
+    # posicoes desatualizadas depois das edicoes acima.
+    deteccao_hipoteca_atual = detectar_secao_hipoteca(texto)
+    hipoteca_corrigida = deteccao_hipoteca_atual is not None and deteccao_hipoteca_atual["tinha_duplicacao"]
+    if hipoteca_corrigida:
+        log("Corrigindo trecho duplicado na cláusula de Hipoteca Cedular ...")
+        texto = aplicar_correcao_hipoteca(texto, deteccao_hipoteca_atual)
+
+    texto_mudou = (
+        texto_revisao_imoveis is not None
+        or deve_acrescentar_clausula
+        or deve_remover_clausula
+        or hipoteca_corrigida
+    )
+    if texto_mudou:
         # o texto mudou -- refaz blocos/assinaturas em cima do texto
         # corrigido, pra qualificacao continuar correta.
         blocos = extrair_blocos_dados(texto)
@@ -1121,6 +1686,14 @@ def finalizar_geracao(dados, pasta_saida, texto_revisao_imoveis=None, checkbox_s
     else:
         blocos = dados["blocos"]
         assinaturas_qualificadas = dados["assinaturas_qualificadas"]
+
+    if texto_revisao_assinaturas is not None:
+        log("Aplicando revisão das assinaturas ...")
+        texto = aplicar_revisao_assinaturas(texto, assinaturas_qualificadas, texto_revisao_assinaturas, log=log)
+
+    if agencia_procurador:
+        log(f"Acrescentando assinatura da CREDORA (procuradores da agência {agencia_procurador['rotulo']}) ...")
+        texto = aplicar_assinatura_procurador(texto, agencia_procurador)
 
     if dados["nome_emitente"] and dados["numero_titulo"]:
         nome_arquivo = sanitizar_nome_arquivo(f"{dados['nome_emitente']} - {dados['numero_titulo']}") + ".docx"
@@ -1158,6 +1731,8 @@ class App(tk.Tk):
         self.var_cartorio = tk.StringVar()
         self.var_procurador = tk.StringVar()
         self.dados_preparados = None  # resultado de preparar_arquivo()
+        self.agencias_procuradores = []  # lista de dicts vinda da planilha
+        pasta_documentos()  # garante que a pasta exista, pronta pra planilha ser colocada
 
         frame_top = tk.Frame(self, padx=12, pady=12)
         frame_top.pack(fill="x")
@@ -1181,6 +1756,7 @@ class App(tk.Tk):
         self.abas.pack(fill="both", expand=True, padx=12, pady=(6, 6))
 
         self._montar_aba_descricao()
+        self._montar_aba_assinaturas()
         self._montar_aba_opcoes()
 
         self.log_text = scrolledtext.ScrolledText(self, padx=8, pady=8, state="disabled", wrap="word", height=8)
@@ -1204,6 +1780,22 @@ class App(tk.Tk):
         self.texto_revisao = scrolledtext.ScrolledText(aba, height=16, wrap="word")
         self.texto_revisao.pack(fill="both", expand=True)
 
+    def _montar_aba_assinaturas(self):
+        aba = tk.Frame(self.abas, padx=8, pady=8)
+        self.abas.add(aba, text="Assinaturas")
+
+        tk.Label(
+            aba,
+            text="Um bloco por assinatura (emitente/avalista/PJ), com todos os dados que vão pro\n"
+                 "Word. Edite pra corrigir algo, apague o texto de um bloco pra remover a\n"
+                 "qualificação dele, ou copie o formato \"--- N. PAPEL (documento) ---\" pra\n"
+                 "acrescentar uma assinatura nova (numere maior que as existentes).",
+            fg="#555555", justify="left", anchor="w",
+        ).pack(fill="x", anchor="w", pady=(0, 4))
+
+        self.texto_assinaturas = scrolledtext.ScrolledText(aba, height=16, wrap="word")
+        self.texto_assinaturas.pack(fill="both", expand=True)
+
     def _montar_aba_opcoes(self):
         aba = tk.Frame(self.abas, padx=12, pady=12)
         self.abas.add(aba, text="Opções")
@@ -1219,9 +1811,9 @@ class App(tk.Tk):
 
         tk.Label(
             aba,
-            text="Se desmarcado ao processar, a cláusula não foi encontrada na cédula -- marque\n"
-                 "para acrescentá-la (aparece em azul no Word gerado). Se já existir, marcar de\n"
-                 "novo não duplica.",
+            text="Se veio desmarcado, a cláusula não foi encontrada -- marque para acrescentá-la\n"
+                 "(aparece em azul no Word). Se veio marcado (já existia) e você desmarcar, ela é\n"
+                 "removida do documento. Deixar marcado como veio não duplica.",
             fg="#555555", justify="left", anchor="w",
         ).pack(fill="x", anchor="w", pady=(0, 12))
 
@@ -1232,6 +1824,13 @@ class App(tk.Tk):
         tk.Label(aba, text="Procuradores:").pack(anchor="w")
         self.combo_procurador = ttk.Combobox(aba, textvariable=self.var_procurador, values=[], width=60)
         self.combo_procurador.pack(fill="x", anchor="w")
+        tk.Label(
+            aba,
+            text=f'Lida da pasta "{NOME_PASTA_DOCUMENTOS}" (do lado deste programa), arquivo\n'
+                 f'"{NOME_PLANILHA_PROCURADORES}". Selecionando uma agência, acrescenta a\n'
+                 "assinatura da CREDORA representada pelos procuradores dela (em azul).",
+            fg="#555555", justify="left", anchor="w",
+        ).pack(fill="x", anchor="w", pady=(4, 0))
 
     # ------------------------------------------------------------------
     def log(self, mensagem):
@@ -1279,6 +1878,10 @@ class App(tk.Tk):
             else:
                 self.aviso_label.config(text="Documento não tem seção \"2 - IMÓVEIS\" -- nada para revisar aqui.")
 
+            # aba Assinaturas
+            self.texto_assinaturas.delete("1.0", "end")
+            self.texto_assinaturas.insert("1.0", montar_texto_revisao_assinaturas(self.dados_preparados["assinaturas_qualificadas"]))
+
             # aba Opcoes: clausula de superveniencia
             tem_clausula = self.dados_preparados["tem_clausula_superveniencia"]
             self.var_superveniencia.set(tem_clausula)
@@ -1294,6 +1897,11 @@ class App(tk.Tk):
             else:
                 self.combo_cartorio.config(values=[])
                 self.var_cartorio.set("")
+
+            # aba Opcoes: procuradores (le a planilha "documentos/Procuradores - Cartórios.xlsx")
+            self.agencias_procuradores = ler_planilha_procuradores(log=self.log)
+            self.combo_procurador.config(values=[a["rotulo"] for a in self.agencias_procuradores])
+            self.var_procurador.set("")
 
             self.log("\nProcessado. Confira as abas acima e clique em \"2. Gerar Word\".")
             self.botao_gerar.config(state="normal")
@@ -1315,12 +1923,21 @@ class App(tk.Tk):
             if self.dados_preparados["deteccao_imoveis"]:
                 texto_revisao = self.texto_revisao.get("1.0", "end-1c")
 
+            texto_assinaturas_editado = self.texto_assinaturas.get("1.0", "end-1c")
+
+            rotulo_agencia = self.var_procurador.get().strip()
+            agencia_selecionada = next(
+                (a for a in self.agencias_procuradores if a["rotulo"] == rotulo_agencia), None
+            )
+
             pasta_saida = os.path.dirname(self.caminho_prn.get().strip())
             caminho_saida = finalizar_geracao(
                 self.dados_preparados,
                 pasta_saida,
                 texto_revisao_imoveis=texto_revisao,
                 checkbox_superveniencia=self.var_superveniencia.get(),
+                texto_revisao_assinaturas=texto_assinaturas_editado,
+                agencia_procurador=agencia_selecionada,
                 log=self.log,
             )
             self.log("\nConcluído com sucesso!")
