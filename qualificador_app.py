@@ -77,6 +77,50 @@ def decodificar_prn(caminho, codepage="cp850"):
 # ETAPA 2: REESTRUTURACAO (Interveniente Garantidor -> dentro de "Por aval...")
 # ======================================================================
 
+def _mesclar_interveniente_solto_duplicado(texto):
+    """Quando 'Interveniente(s) Garantidor(es)' aparece SOZINHO (sem
+    dois pontos, sem o texto 'Assino(amos) tambem...') como cabecalho
+    de uma assinatura, e a pessoa que assinaria ali JA esta duplicada
+    nos campos de AVALISTA, remove esse bloco (sublinhado + cabecalho +
+    Nome + CPF) e mescla o titulo em 'Por aval ao(s) emitente(s):'."""
+    m_heading = PADRAO_INTERVENIENTE_LABEL_SOLTO.search(texto)
+    if not m_heading:
+        return texto
+
+    janela = texto[m_heading.end():m_heading.end() + 300]
+    m_cpf = CPF_ASSINATURA_RE.search(janela)
+    if not m_cpf:
+        return texto
+    cpf_interveniente = m_cpf.group(1)
+
+    m_avalista_heading = re.search(r"Por\s+aval\s+ao\(s\)\s+emitente\(s\):", texto, re.IGNORECASE)
+    if not m_avalista_heading:
+        return texto
+    trecho_avalista = texto[m_avalista_heading.end():m_avalista_heading.end() + 3000]
+    if cpf_interveniente not in trecho_avalista:
+        return texto  # nao e duplicado -- mantem a assinatura como esta
+
+    # acha o sublinhado logo antes do cabecalho (se estiver perto) pra
+    # remover o bloco inteiro, nao so o texto do cabecalho
+    inicio_sublinhado = texto.rfind("_" * 10, 0, m_heading.start())
+    if inicio_sublinhado != -1 and m_heading.start() - inicio_sublinhado < 200:
+        ponto_inicio = texto.rfind("\n", 0, inicio_sublinhado) + 1
+    else:
+        ponto_inicio = texto.rfind("\n", 0, m_heading.start()) + 1
+
+    pos_fim_cpf = m_heading.end() + m_cpf.end()
+    fim_linha = texto.find("\n", pos_fim_cpf)
+    ponto_fim = fim_linha + 1 if fim_linha != -1 else pos_fim_cpf
+
+    texto = texto[:ponto_inicio] + texto[ponto_fim:]
+    texto = re.sub(
+        r"Por\s+aval\s+ao\(s\)\s+emitente\(s\):",
+        "POR AVAL AO(S) EMITENTE(S) / INTERVENIENTE(S) GARANTIDOR(ES):",
+        texto, count=1, flags=re.IGNORECASE,
+    )
+    return texto
+
+
 def reestruturar_documento(texto):
     padrao_span = re.compile(
         r"INTERVENIENTE\(S\)\s+GARANTIDOR\(ES\):.*?(?=CARTILHA\s+DO\s+CR[EÉ]DITO\s+RURAL:)",
@@ -84,7 +128,7 @@ def reestruturar_documento(texto):
     )
     m = padrao_span.search(texto)
     if not m:
-        return texto
+        return _mesclar_interveniente_solto_duplicado(texto)
 
     span_original = m.group(0)
     m_intro = re.search(r"(Assino\(amos\).*?pelo\s+emitente\.)", span_original, re.IGNORECASE | re.DOTALL)
@@ -107,7 +151,7 @@ def reestruturar_documento(texto):
         "POR AVAL AO(S) EMITENTE(S) / INTERVENIENTE(S) GARANTIDOR(ES):\r\n      \r\n      " + paragrafo_intro,
         texto, count=1, flags=re.IGNORECASE,
     )
-    return texto
+    return _mesclar_interveniente_solto_duplicado(texto)
 
 
 # ======================================================================
@@ -229,7 +273,7 @@ AUTORIZACAO_CONJUGE_RE = re.compile(
 # papel "oficial" da secao), esse so troca o papel DAQUELA assinatura
 # especifica, sem mudar o rastreamento do resto do documento.
 PADRAO_INTERVENIENTE_LABEL_SOLTO = re.compile(
-    r"^[ \t]*Interveniente\(s\)\s+Garantidor\(es\)[ \t]*:?[ \t]*$", re.IGNORECASE | re.MULTILINE
+    r"^[ \t]*Interveniente\(s\)\s+Garantidor\(es\)[ \t]*:?[ \t]*\r?$", re.IGNORECASE | re.MULTILINE
 )
 
 
@@ -458,7 +502,9 @@ PADRAO_SECAO_HIPOTECA = re.compile(
     re.IGNORECASE,
 )
 PADRAO_FIM_SECAO_HIPOTECA = re.compile(
-    r"Al[ée]m\s+das\s+declara[çc][õo]es\s+j[áa]\s+prestadas", re.IGNORECASE
+    r"Al[ée]m\s+das\s+declara[çc][õo]es\s+j[áa]\s+prestadas"
+    r"|Integram\s+a\s+presente\s+garantia",
+    re.IGNORECASE,
 )
 
 
@@ -512,15 +558,54 @@ def detectar_secao_hipoteca(texto):
     }
 
 
-def aplicar_correcao_hipoteca(texto, deteccao):
-    """Substitui o trecho original da clausula de hipoteca pela versao
-    sem duplicacao (mantem o mesmo recuo/formatacao do resto do
-    documento)."""
+def aplicar_correcao_hipoteca(texto, deteccao, texto_revisado=None):
+    """Substitui o trecho original da clausula de hipoteca pelo texto
+    revisado (editado na tela) ou, se nao houver edicao, pela versao
+    sem duplicacao detectada automaticamente. Mantem o mesmo
+    recuo/formatacao do resto do documento."""
+    texto_base = texto_revisado if texto_revisado is not None else deteccao["bloco_sem_duplicacao"]
     linhas_novas = []
-    for linha in deteccao["bloco_sem_duplicacao"].split("\n"):
+    for linha in texto_base.split("\n"):
         linhas_novas.append("      " + linha.strip() if linha.strip() else "      ")
     bloco_novo = "\r\n".join(linhas_novas)
     return texto[:deteccao["span_inicio"]] + bloco_novo + texto[deteccao["span_fim"]:]
+
+
+PADRAO_EMITENTE_PLACEHOLDER_HIPOTECA = re.compile(r"\bEMITENTE\(S\)", re.IGNORECASE)
+
+
+def preencher_emitente_hipoteca(texto, blocos, log=print):
+    """Na Hipoteca Cedular, quando o proprio imovel pertence ao
+    emitente, o PRN as vezes deixa o texto 'EMITENTE(S)' literal (sem
+    substituir pelos dados reais da pessoa) -- ex: 'o(s) EMITENTE(S) ,
+    e a conjuge ...'. Troca esse texto pelos dados completos do
+    emitente vindos do cabecalho, marcados em azul (acrescentado pelo
+    script). So mexe se achar o placeholder DENTRO da clausula de
+    hipoteca -- nao em qualquer 'EMITENTE(S)' do documento."""
+    deteccao = detectar_secao_hipoteca(texto)
+    if not deteccao:
+        return texto, False
+
+    bloco_hipoteca = texto[deteccao["span_inicio"]:deteccao["span_fim"]]
+    m_placeholder = PADRAO_EMITENTE_PLACEHOLDER_HIPOTECA.search(bloco_hipoteca)
+    if not m_placeholder:
+        return texto, False
+
+    emitente = next((b for b in blocos if b["papel"] == "EMITENTE"), None)
+    if not emitente or not emitente.get("bloco_sem_rotulo"):
+        log("  AVISO: achei 'EMITENTE(S)' sem dados na Hipoteca Cedular, mas não achei o bloco do emitente no cabeçalho pra preencher.")
+        return texto, False
+
+    log("  Preenchendo dados do emitente na Hipoteca Cedular (estavam faltando) ...")
+    linhas_originais = emitente["bloco_sem_rotulo"].split("\r\n") if "\r\n" in emitente["bloco_sem_rotulo"] else emitente["bloco_sem_rotulo"].split("\n")
+    texto_emitente = _reflow_prosa(linhas_originais).rstrip(". ").strip()
+
+    substituicao = MARCADOR_ADICIONADO_INICIO + texto_emitente + MARCADOR_ADICIONADO_FIM
+    novo_bloco_hipoteca = bloco_hipoteca[:m_placeholder.start()] + substituicao + bloco_hipoteca[m_placeholder.end():]
+
+    novo_texto = texto[:deteccao["span_inicio"]] + novo_bloco_hipoteca + texto[deteccao["span_fim"]:]
+    return novo_texto, True
+
 
 
 # --------------------------------------------------------------------
@@ -531,7 +616,7 @@ def aplicar_correcao_hipoteca(texto, deteccao):
 # --------------------------------------------------------------------
 
 PADRAO_MARCADOR_ASSINATURA_PREVIEW = re.compile(
-    r"^-{3}\s*(\d+)\.\s*([^(]+?)\s*\(([^)]*)\)\s*-{3}\s*$", re.MULTILINE
+    r"^-{3}\s*(\d+|NOVO)[.:]\s*([^(]+?)\s*\(([^)]*)\)\s*-{3}\s*$", re.MULTILINE
 )
 
 
@@ -546,7 +631,7 @@ def montar_texto_revisao_assinaturas(assinaturas_qualificadas):
         if a.get("autorizacao_conjuge_art_1647"):
             papel += " - AUTORIZAÇÃO CÔNJUGE"
         if a.get("eh_pj"):
-            papel += " (PJ)"
+            papel += " PJ"
         dados = a.get("dados_completos")
         if dados and dados.get("bloco_sem_rotulo"):
             linhas_originais = dados["bloco_sem_rotulo"].split("\r\n") if "\r\n" in dados["bloco_sem_rotulo"] else dados["bloco_sem_rotulo"].split("\n")
@@ -620,19 +705,54 @@ def aplicar_revisao_assinaturas(texto, assinaturas_qualificadas, texto_editado, 
     return texto
 
 
+def _dividir_paragrafos_ignorando_quebra_pagina(texto):
+    """Divide texto em paragrafos por linha em branco, mas ignora blocos
+    de VARIAS linhas em branco seguidas quando a frase anterior nao
+    termina com pontuacao final (.:;) -- isso normalmente e artefato de
+    quebra de pagina do PRN caindo no meio da frase (depois de remover
+    o cabecalho/rodape de paginacao sobra esse espaco), nao um
+    paragrafo novo de verdade. Devolve lista de paragrafos (cada um ja
+    com as linhas internas juntadas em texto corrido)."""
+    linhas = texto.split("\n")
+    paragrafos = []
+    atual = []
+    i = 0
+    while i < len(linhas):
+        linha = linhas[i]
+        if linha.strip() == "":
+            j = i
+            while j < len(linhas) and linhas[j].strip() == "":
+                j += 1
+            n_blanks = j - i
+            ultima = next((l.strip() for l in reversed(atual) if l.strip()), "")
+            termina_frase = bool(re.search(r"[.:;]\s*$", ultima)) if ultima else True
+            if termina_frase:
+                if atual:
+                    paragrafos.append(_normalizar_espacos(" ".join(atual)))
+                    atual = []
+            # senao (a frase anterior nao termina em pontuacao): quase
+            # sempre e artefato de quebra de pagina (o cabecalho/rodape
+            # de paginacao no meio, ja removido, deixa 1 ou mais linhas
+            # em branco para tras) -- nao fecha o paragrafo, so pula as
+            # linhas em branco e continua
+            i = j
+            continue
+        atual.append(linha.strip())
+        i += 1
+    if atual:
+        paragrafos.append(_normalizar_espacos(" ".join(atual)))
+    return paragrafos
+
+
 def montar_texto_revisao(deteccao):
     """Monta o texto EDITAVEL mostrado na tela de revisao: tudo que vem
     depois de "2 - IMOVEIS:" ate onde a secao termina (onde a avaliacao
     e encontrada) -- reflui as quebras de linha de largura fixa do PRN
     em paragrafos corridos, mais faceis de ler/editar na caixa de texto."""
     conteudo = PADRAO_SECAO_IMOVEIS.sub("", deteccao["bloco_original"], count=1)
+    conteudo = conteudo.replace("\r\n", "\n").replace("\r", "\n")
 
-    paragrafos_brutos = re.split(r"\r?\n[ \t]*\r?\n", conteudo)
-    paragrafos = []
-    for p in paragrafos_brutos:
-        linha_unica = _normalizar_espacos(p.replace("\r\n", " ").replace("\n", " "))
-        if linha_unica:
-            paragrafos.append(linha_unica)
+    paragrafos = _dividir_paragrafos_ignorando_quebra_pagina(conteudo)
 
     aviso_linhas = []
     if deteccao["tem_hipoteca"]:
@@ -1265,20 +1385,8 @@ def gerar_docx(texto, blocos, assinaturas_qualificadas, caminho_saida):
 
         if tipo == "assinatura":
             linhas_bloco = [{**bloco[0], "texto": bloco[0]["texto"].strip()}]
-            resto = bloco[1:]
-            if resto and PADRAO_AUTORIZACAO_UMA_LINHA.search(resto[0]["texto"]):
-                linhas_bloco.append({**resto[0], "texto": resto[0]["texto"].strip()})
-                resto = resto[1:]
-            # rotulo solto "Interveniente(s) Garantidor(es)" (sem ":"),
-            # que pode aparecer sozinho dentro de outro bloco (ex: dentro
-            # do EMITENTE(S)) -- mantem visivel e avanca, senao a leitura
-            # sequencial trava aqui e o Nome/CPF seguintes ficam perdidos
-            # (e todas as assinaturas depois saem deslocadas/erradas).
-            if resto and PADRAO_INTERVENIENTE_LABEL_SOLTO.match(resto[0]["texto"].strip()):
-                linhas_bloco.append({**resto[0], "texto": resto[0]["texto"].strip()})
-                resto = resto[1:]
-            # a partir daqui, busca as proximas linhas "de verdade" pulando
-            # linhas em branco e marcadores de paginacao (a assinatura pode
+            # busca as proximas linhas "de verdade" pulando linhas em
+            # branco e marcadores de paginacao (a assinatura pode
             # atravessar quebra de pagina -- ex: "Razao Social:" numa
             # pagina e o "CNPJ" na seguinte). Para se achar OUTRO sublinhado.
             cursor = i + 1
@@ -1353,9 +1461,21 @@ def gerar_docx(texto, blocos, assinaturas_qualificadas, caminho_saida):
 
         else:  # prosa
             texto_reflow = _reflow_prosa([l["texto"] for l in bloco])
+            # titulos como "Cédula Rural Hipotecária" vem no PRN com uma
+            # penca de espacos a esquerda (centralizacao calculada pra
+            # largura antiga, que nao faz mais sentido) -- detecta pelo
+            # recuo original bem maior que o padrao (6 espacos) e
+            # centraliza de verdade, em vez de so alinhar a esquerda
+            eh_titulo_centralizado = (
+                len(bloco) == 1
+                and len(bloco[0]["texto"]) - len(bloco[0]["texto"].lstrip(" ")) >= 15
+            )
             unidades.append({
                 "tipo": "linha",
-                "linha": {"texto": texto_reflow, "quebra_forcada": atual["quebra_forcada"], "fonte_menor": atual["fonte_menor"]},
+                "linha": {
+                    "texto": texto_reflow, "quebra_forcada": atual["quebra_forcada"],
+                    "fonte_menor": atual["fonte_menor"], "centralizado": eh_titulo_centralizado,
+                },
             })
             j = j  # (mantem o j calculado no agrupamento inicial do bloco)
 
@@ -1417,14 +1537,33 @@ def gerar_docx(texto, blocos, assinaturas_qualificadas, caminho_saida):
         _adicionar_texto_exceto_ultima_pagina(p_footer, "Continua Proxima Pagina")
     # -------------------------------------------------------------------------
 
+    # remove linhas em branco sobrando depois da ULTIMA assinatura -- senao
+    # podem empurrar o inicio da proxima secao (Cartilha/SICOR, que forca
+    # pagina nova) pra uma pagina que fica quase vazia, so com essas
+    # linhas em branco antes da quebra.
+    indice_ultimo_bloco = None
+    for idx_u, u in enumerate(unidades):
+        if u["tipo"] == "bloco":
+            indice_ultimo_bloco = idx_u
+    if indice_ultimo_bloco is not None:
+        fim = indice_ultimo_bloco + 1
+        while fim < len(unidades) and unidades[fim]["tipo"] == "linha" and unidades[fim]["linha"]["texto"].strip() == "":
+            fim += 1
+        # mantem tudo ate a ultima assinatura, descarta so o trecho em
+        # branco logo depois, e mantem qualquer coisa que venha depois
+        # disso (caso exista conteudo de verdade, o que nao deveria
+        # acontecer aqui, mas por seguranca nao descarta as cegas)
+        if fim > indice_ultimo_bloco + 1:
+            unidades = unidades[:indice_ultimo_bloco + 1] + unidades[fim:]
+
     altura_linha_pt = FONTE_PT * FATOR_ALTURA_LINHA
 
-    def adicionar_paragrafo(texto_linha, fonte_menor, manter_com_proximo=False, manter_junto=False):
+    def adicionar_paragrafo(texto_linha, fonte_menor, manter_com_proximo=False, manter_junto=False, centralizado=False):
         eh_adicionado = MARCADOR_ADICIONADO_INICIO in texto_linha
         texto_limpo = texto_linha.replace(MARCADOR_ADICIONADO_INICIO, "").replace(MARCADOR_ADICIONADO_FIM, "")
 
         p = doc.add_paragraph()
-        p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER if centralizado else WD_ALIGN_PARAGRAPH.LEFT
         pf = p.paragraph_format
         pf.space_after = Pt(0)
         pf.space_before = Pt(0)
@@ -1447,7 +1586,10 @@ def gerar_docx(texto, blocos, assinaturas_qualificadas, caminho_saida):
 
     for u in unidades:
         if u["tipo"] == "linha":
-            adicionar_paragrafo(u["linha"]["texto"], u["linha"]["fonte_menor"])
+            adicionar_paragrafo(
+                u["linha"]["texto"], u["linha"]["fonte_menor"],
+                centralizado=u["linha"].get("centralizado", False),
+            )
         else:
             n_linhas_bloco = len(u["linhas"])
             for idx, l in enumerate(u["linhas"]):
@@ -1578,6 +1720,11 @@ def preparar_arquivo(caminho_prn, log=print):
 
     log("Extraindo blocos de dados e qualificando assinaturas ...")
     blocos = extrair_blocos_dados(texto)
+
+    texto, emitente_preenchido = preencher_emitente_hipoteca(texto, blocos, log=log)
+    if emitente_preenchido:
+        blocos = extrair_blocos_dados(texto)
+
     assinaturas = extrair_assinaturas(texto)
     assinaturas_qualificadas = qualificar_com_blocos(assinaturas, blocos)
     log(f"  {len(assinaturas_qualificadas)} assinatura(s) qualificada(s).")
@@ -1627,20 +1774,20 @@ def preparar_arquivo(caminho_prn, log=print):
 
 def finalizar_geracao(
     dados, pasta_saida, texto_revisao_imoveis=None, checkbox_superveniencia=None,
-    texto_revisao_assinaturas=None, agencia_procurador=None, log=print,
+    texto_revisao_assinaturas=None, texto_revisao_hipoteca=None, agencia_procurador=None, log=print,
 ):
     """Aplica a correcao da secao de imoveis (se houver texto revisado),
     acrescenta a clausula de Superveniencia se o checkbox estiver marcado
     E ela nao existia no documento original (evita duplicidade), corrige
-    a Hipoteca Cedular se houver duplicacao, aplica a revisao manual das
-    assinaturas (se editada), acrescenta a assinatura da CREDORA
-    representada pelos procuradores da agencia escolhida (se houver), e
-    gera o Word."""
+    a Hipoteca Cedular (edicao manual, ou duplicacao automatica se nao
+    editada), aplica a revisao manual das assinaturas (se editada),
+    acrescenta a assinatura da CREDORA representada pelos procuradores
+    da agencia escolhida (se houver), e gera o Word."""
     texto = dados["texto"]
     posicao_fim_descricao = dados["deteccao_imoveis"]["span_fim"] if dados["deteccao_imoveis"] else None
 
     if dados["deteccao_imoveis"] and texto_revisao_imoveis is not None:
-        log("Aplicando correções da seção '2 - IMÓVEIS' ...")
+        log("Aplicando correções da descrição do imóvel ...")
         texto, posicao_fim_descricao = aplicar_correcao_imoveis(texto, dados["deteccao_imoveis"], texto_revisao_imoveis)
 
     # 3 casos pro checkbox de Superveniencia:
@@ -1663,12 +1810,21 @@ def finalizar_geracao(
         log("Removendo cláusula de Superveniência (desmarcada pelo colaborador) ...")
         texto = remover_clausula_superveniencia(texto)
 
-    # Hipoteca Cedular: corrige duplicacao automaticamente, se houver.
-    # Redeteta em cima do texto ATUAL (nao o original) pra nao usar
-    # posicoes desatualizadas depois das edicoes acima.
+    # Hipoteca Cedular: aplica a edicao manual (se houve) ou corrige
+    # duplicacao automaticamente. Redeteta em cima do texto ATUAL (nao
+    # o original) pra nao usar posicoes desatualizadas depois das
+    # edicoes acima.
     deteccao_hipoteca_atual = detectar_secao_hipoteca(texto)
-    hipoteca_corrigida = deteccao_hipoteca_atual is not None and deteccao_hipoteca_atual["tinha_duplicacao"]
-    if hipoteca_corrigida:
+    hipoteca_editada = deteccao_hipoteca_atual is not None and texto_revisao_hipoteca is not None
+    hipoteca_corrigida_auto = (
+        not hipoteca_editada
+        and deteccao_hipoteca_atual is not None
+        and deteccao_hipoteca_atual["tinha_duplicacao"]
+    )
+    if hipoteca_editada:
+        log("Aplicando correções da descrição do bem em Hipoteca Cedular ...")
+        texto = aplicar_correcao_hipoteca(texto, deteccao_hipoteca_atual, texto_revisao_hipoteca)
+    elif hipoteca_corrigida_auto:
         log("Corrigindo trecho duplicado na cláusula de Hipoteca Cedular ...")
         texto = aplicar_correcao_hipoteca(texto, deteccao_hipoteca_atual)
 
@@ -1676,7 +1832,8 @@ def finalizar_geracao(
         texto_revisao_imoveis is not None
         or deve_acrescentar_clausula
         or deve_remover_clausula
-        or hipoteca_corrigida
+        or hipoteca_editada
+        or hipoteca_corrigida_auto
     )
     if texto_mudou:
         # o texto mudou -- refaz blocos/assinaturas em cima do texto
@@ -1731,6 +1888,7 @@ class App(tk.Tk):
         self.var_cartorio = tk.StringVar()
         self.var_procurador = tk.StringVar()
         self.dados_preparados = None  # resultado de preparar_arquivo()
+        self.tipo_descricao = None  # "imoveis" | "hipoteca" | None -- qual tipo esta na aba de descricao
         self.agencias_procuradores = []  # lista de dicts vinda da planilha
         pasta_documentos()  # garante que a pasta exista, pronta pra planilha ser colocada
 
@@ -1767,15 +1925,16 @@ class App(tk.Tk):
     # ------------------------------------------------------------------
     def _montar_aba_descricao(self):
         aba = tk.Frame(self.abas, padx=8, pady=8)
-        self.abas.add(aba, text="Descrição da Matrícula")
+        self.abas.add(aba, text="Descrição do Imóvel")
 
         self.aviso_label = tk.Label(aba, text="", fg="#b71c1c", justify="left", anchor="w")
         self.aviso_label.pack(fill="x", anchor="w")
 
-        tk.Label(
-            aba, text="Descrição do imóvel (seção \"2 - IMÓVEIS\") -- edite aqui se precisar corrigir:",
+        self.label_titulo_descricao = tk.Label(
+            aba, text="Descrição do imóvel -- edite aqui se precisar corrigir:",
             anchor="w", justify="left",
-        ).pack(fill="x", anchor="w", pady=(6, 2))
+        )
+        self.label_titulo_descricao.pack(fill="x", anchor="w", pady=(6, 2))
 
         self.texto_revisao = scrolledtext.ScrolledText(aba, height=16, wrap="word")
         self.texto_revisao.pack(fill="both", expand=True)
@@ -1862,21 +2021,34 @@ class App(tk.Tk):
 
         try:
             self.dados_preparados = preparar_arquivo(caminho, log=self.log)
-            deteccao = self.dados_preparados["deteccao_imoveis"]
+            deteccao_imoveis = self.dados_preparados["deteccao_imoveis"]
+            deteccao_hipoteca = self.dados_preparados["deteccao_hipoteca"]
 
             self.texto_revisao.delete("1.0", "end")
-            if deteccao:
+            if deteccao_imoveis:
+                self.tipo_descricao = "imoveis"
                 avisos = []
-                if deteccao["tem_hipoteca"]:
-                    avisos.append("⚠ Hipoteca encontrada na seção de imóveis.")
-                if deteccao["avaliacoes_duplicadas"]:
+                if deteccao_imoveis["tem_hipoteca"]:
+                    avisos.append("⚠ Hipoteca encontrada na descrição do imóvel.")
+                if deteccao_imoveis["avaliacoes_duplicadas"]:
                     avisos.append("⚠ Os dois valores de avaliação do imóvel são IDÊNTICOS -- confira se está certo.")
                 if not avisos:
                     avisos.append("Nenhum problema encontrado -- revise/ajuste os valores abaixo se quiser.")
                 self.aviso_label.config(text="\n".join(avisos))
-                self.texto_revisao.insert("1.0", montar_texto_revisao(deteccao))
+                self.label_titulo_descricao.config(text="Descrição do imóvel -- edite aqui se precisar corrigir:")
+                self.texto_revisao.insert("1.0", montar_texto_revisao(deteccao_imoveis))
+            elif deteccao_hipoteca:
+                self.tipo_descricao = "hipoteca"
+                if deteccao_hipoteca["tinha_duplicacao"]:
+                    self.aviso_label.config(text="⚠ Trecho duplicado encontrado e já corrigido abaixo -- confira.")
+                else:
+                    self.aviso_label.config(text="Nenhum problema encontrado -- revise/ajuste se quiser.")
+                self.label_titulo_descricao.config(text="Descrição do bem em Hipoteca Cedular -- edite aqui se precisar corrigir:")
+                self.texto_revisao.insert("1.0", deteccao_hipoteca["bloco_sem_duplicacao"])
             else:
-                self.aviso_label.config(text="Documento não tem seção \"2 - IMÓVEIS\" -- nada para revisar aqui.")
+                self.tipo_descricao = None
+                self.aviso_label.config(text="")
+                self.label_titulo_descricao.config(text="Descrição do imóvel -- não encontrada nesta cédula, nada para revisar aqui.")
 
             # aba Assinaturas
             self.texto_assinaturas.delete("1.0", "end")
@@ -1919,9 +2091,12 @@ class App(tk.Tk):
 
         self.botao_gerar.config(state="disabled")
         try:
-            texto_revisao = None
-            if self.dados_preparados["deteccao_imoveis"]:
-                texto_revisao = self.texto_revisao.get("1.0", "end-1c")
+            texto_revisao_imoveis = None
+            texto_revisao_hipoteca = None
+            if self.tipo_descricao == "imoveis":
+                texto_revisao_imoveis = self.texto_revisao.get("1.0", "end-1c")
+            elif self.tipo_descricao == "hipoteca":
+                texto_revisao_hipoteca = self.texto_revisao.get("1.0", "end-1c")
 
             texto_assinaturas_editado = self.texto_assinaturas.get("1.0", "end-1c")
 
@@ -1934,9 +2109,10 @@ class App(tk.Tk):
             caminho_saida = finalizar_geracao(
                 self.dados_preparados,
                 pasta_saida,
-                texto_revisao_imoveis=texto_revisao,
+                texto_revisao_imoveis=texto_revisao_imoveis,
                 checkbox_superveniencia=self.var_superveniencia.get(),
                 texto_revisao_assinaturas=texto_assinaturas_editado,
+                texto_revisao_hipoteca=texto_revisao_hipoteca,
                 agencia_procurador=agencia_selecionada,
                 log=self.log,
             )
